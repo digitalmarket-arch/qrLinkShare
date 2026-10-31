@@ -1,0 +1,8 @@
+{
+  "name": "qrLinkShare — Instant QR Code & Link Studio",
+  "description": "Precision QR code generator and shareable link workspace for URLs, Wi-Fi credentials, vCards, UTM campaign links, and printable QR sheets.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

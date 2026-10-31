@@ -5,17 +5,17 @@ const SAMPLE_DIAGRAM_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="800" 
   <rect x="32" y="32" width="736" height="416" rx="16" stroke="#334155" stroke-width="2" stroke-dasharray="6 6"/>
   <rect x="72" y="110" width="220" height="260" rx="16" fill="#1E293B" stroke="#6366F1" stroke-width="2"/>
   <text x="182" y="155" fill="#F8FAFC" font-family="sans-serif" font-size="18" font-weight="bold" text-anchor="middle">Mobile Handset</text>
-  <text x="182" y="182" fill="#94A3B8" font-family="monospace" font-size="13" text-anchor="middle">Scans QR · Uploads</text>
+  <text x="182" y="182" fill="#94A3B8" font-family="monospace" font-size="13" text-anchor="middle">Scans QR · Approves Login</text>
   <rect x="112" y="210" width="140" height="120" rx="12" fill="#0F172A" stroke="#475569"/>
   <circle cx="182" cy="270" r="32" fill="#4F46E5" fill-opacity="0.25" stroke="#818CF8" stroke-width="2"/>
   <path d="M170 270L178 278L196 260" stroke="#A5B4FC" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
   <path d="M312 240H488" stroke="#6366F1" stroke-width="3" stroke-dasharray="8 8"/>
   <polygon points="488,240 474,232 474,248" fill="#6366F1"/>
   <rect x="346" y="206" width="108" height="30" rx="6" fill="#1E1B4B" stroke="#4F46E5"/>
-  <text x="400" y="226" fill="#C7D2FE" font-family="monospace" font-size="12" text-anchor="middle">WSS SYNC-42</text>
+  <text x="400" y="226" fill="#C7D2FE" font-family="monospace" font-size="12" text-anchor="middle">QR LOGIN SYNC</text>
   <rect x="508" y="110" width="220" height="260" rx="16" fill="#1E293B" stroke="#10B981" stroke-width="2"/>
-  <text x="618" y="155" fill="#F8FAFC" font-family="sans-serif" font-size="18" font-weight="bold" text-anchor="middle">Desktop Studio</text>
-  <text x="618" y="182" fill="#94A3B8" font-family="monospace" font-size="13" text-anchor="middle">Instant Download</text>
+  <text x="618" y="155" fill="#F8FAFC" font-family="sans-serif" font-size="18" font-weight="bold" text-anchor="middle">Desktop Browser</text>
+  <text x="618" y="182" fill="#94A3B8" font-family="monospace" font-size="13" text-anchor="middle">Auto-Opens Links</text>
   <rect x="538" y="210" width="160" height="32" rx="6" fill="#0F172A" stroke="#334155"/>
   <rect x="538" y="254" width="160" height="32" rx="6" fill="#0F172A" stroke="#334155"/>
   <rect x="538" y="298" width="160" height="32" rx="6" fill="#0F172A" stroke="#334155"/>
@@ -23,15 +23,15 @@ const SAMPLE_DIAGRAM_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="800" 
 
 const SAMPLE_SPEC_MARKDOWN = `# Q4 Mobile-to-Desktop Release Checklist (v4.2)
 
-## 1. Transfer Channel Verification
-- Room Code: SYNC-42
-- Protocol: WebSocket + HTTP Direct Binary Stream
-- Max Payload Size: 25 MB per drop
+## 1. QR Login & Auto-Open Verification
+- Room / Vault Code: SYNC-42
+- Authentication: QR Scan, 6-Digit PIN, or Google Sign-In
+- Retention Tiers: Temporary Links vs. Saved Links / Data / Docs
 
 ## 2. Shared Deliverables
-1. Checkout UI Flow Architecture (SVG Diagram)
-2. Staging Environment Link: https://staging.acme-design.io/proto/v4-checkout
-3. Production Environment Variables Bundle (JSON)
+1. Interactive Checkout Prototype (Temporary Link — Auto-Opens on Desktop Login)
+2. Architecture Reference Docs: https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API
+3. Production Environment Variables Bundle (Saved JSON Data)
 
 ## 3. Sign-Off
 Approved by Mobile Platform Engineering & Design Systems.`;
@@ -39,10 +39,10 @@ Approved by Mobile Platform Engineering & Design Systems.`;
 const SAMPLE_JSON_CONFIG = JSON.stringify(
   {
     app: 'qrLinkShare',
-    version: '4.2.0',
-    bridgeMode: 'websocket-direct',
-    supportedPayloads: ['link', 'image', 'document', 'file', 'text'],
-    encryption: 'TLS-1.3',
+    version: '4.5.0',
+    authMethods: ['qr-scan', 'six-digit-pin', 'google-oauth'],
+    retentionTiers: ['temporary', 'saved'],
+    autoOpenNewestLinkOnDesktop: true,
     defaultRoom: 'SYNC-42',
   },
   null,
@@ -60,21 +60,39 @@ export function createInitialSeedItems(roomId = 'SYNC-42'): SharedItem[] {
   const now = Date.now();
   return [
     {
-      id: 'seed-link-1',
+      id: 'seed-link-temp-1',
       roomId,
       category: 'link',
+      retentionMode: 'temporary',
       title: 'Interactive Checkout Prototype (Staging v4.2)',
-      content: 'https://staging.acme-design.io/proto/v4-checkout?utm_source=qr_bridge',
+      content:
+        'https://staging.acme-design.io/proto/v4-checkout?utm_source=qr_bridge',
       sizeBytes: 68,
       senderDevice: 'mobile',
       senderName: 'iPhone 16 Pro · Field Test',
-      createdAt: new Date(now - 1000 * 60 * 2).toISOString(),
+      createdAt: new Date(now - 1000 * 60 * 1).toISOString(),
       pinned: true,
+      openedOnDesktop: false,
+    },
+    {
+      id: 'seed-link-saved-1',
+      roomId,
+      category: 'link',
+      retentionMode: 'saved',
+      title: 'MDN WebSockets & Real-Time API Reference',
+      content: 'https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API',
+      sizeBytes: 63,
+      senderDevice: 'mobile',
+      senderName: 'iPhone 16 Pro · Field Test',
+      createdAt: new Date(now - 1000 * 60 * 5).toISOString(),
+      pinned: true,
+      openedOnDesktop: false,
     },
     {
       id: 'seed-image-1',
       roomId,
       category: 'image',
+      retentionMode: 'saved',
       title: 'Phone-to-Desktop Sync Architecture Diagram',
       content: 'Whiteboard snapshot exported from mobile companion app.',
       fileName: 'sync-architecture-v4.svg',
@@ -83,13 +101,15 @@ export function createInitialSeedItems(roomId = 'SYNC-42'): SharedItem[] {
       dataUrl: toBase64DataUrl(SAMPLE_DIAGRAM_SVG, 'image/svg+xml'),
       senderDevice: 'mobile',
       senderName: 'iPhone 16 Pro · Field Test',
-      createdAt: new Date(now - 1000 * 60 * 8).toISOString(),
-      pinned: true,
+      createdAt: new Date(now - 1000 * 60 * 12).toISOString(),
+      pinned: false,
+      openedOnDesktop: true,
     },
     {
       id: 'seed-doc-1',
       roomId,
       category: 'document',
+      retentionMode: 'saved',
       title: 'Q4 Mobile Handoff & Release Notes',
       content: SAMPLE_SPEC_MARKDOWN,
       fileName: 'Q4_Mobile_Handoff_Spec.md',
@@ -98,14 +118,16 @@ export function createInitialSeedItems(roomId = 'SYNC-42'): SharedItem[] {
       dataUrl: toBase64DataUrl(SAMPLE_SPEC_MARKDOWN, 'text/markdown'),
       senderDevice: 'desktop',
       senderName: 'MacBook Pro M4 · Studio',
-      createdAt: new Date(now - 1000 * 60 * 19).toISOString(),
+      createdAt: new Date(now - 1000 * 60 * 24).toISOString(),
       pinned: false,
+      openedOnDesktop: true,
     },
     {
       id: 'seed-file-1',
       roomId,
       category: 'file',
-      title: 'Mobile Bridge Runtime Manifest (JSON)',
+      retentionMode: 'saved',
+      title: 'Mobile Bridge Runtime Manifest (JSON Data)',
       content: SAMPLE_JSON_CONFIG,
       fileName: 'bridge-manifest.json',
       mimeType: 'application/json',
@@ -113,21 +135,24 @@ export function createInitialSeedItems(roomId = 'SYNC-42'): SharedItem[] {
       dataUrl: toBase64DataUrl(SAMPLE_JSON_CONFIG, 'application/json'),
       senderDevice: 'mobile',
       senderName: 'Pixel 9 Pro · QA Lab',
-      createdAt: new Date(now - 1000 * 60 * 34).toISOString(),
+      createdAt: new Date(now - 1000 * 60 * 38).toISOString(),
       pinned: false,
+      openedOnDesktop: true,
     },
     {
       id: 'seed-text-1',
       roomId,
       category: 'text',
-      title: 'Guest Lab Wi-Fi & SSH Tunnel Snippet',
+      retentionMode: 'temporary',
+      title: 'Temporary One-Time SSH Tunnel & Lab Wi-Fi Note',
       content:
         'SSID: Acme-Hardware-Lab-5G | Pass: Horizon#2026! | Tunnel: ssh -L 3000:localhost:3000 dev@10.0.4.18',
       sizeBytes: 98,
-      senderDevice: 'desktop',
-      senderName: 'MacBook Pro M4 · Studio',
+      senderDevice: 'mobile',
+      senderName: 'iPhone 16 Pro · Field Test',
       createdAt: new Date(now - 1000 * 60 * 52).toISOString(),
       pinned: false,
+      openedOnDesktop: false,
     },
   ];
 }

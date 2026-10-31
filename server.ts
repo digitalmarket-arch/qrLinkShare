@@ -8,10 +8,13 @@ import {
   ConnectedDevice,
   CreateShareItemPayload,
   DeviceType,
+  QrLoginChallenge,
+  RetentionMode,
   SharedItem,
 } from './src/types/share';
 import {
   normalizeRoomCode,
+  validatePinCode,
   validateShareSubmission,
 } from './src/utils/shareLogic';
 import { createInitialSeedItems } from './src/utils/seedData';
@@ -26,6 +29,7 @@ interface RoomRecord {
 }
 
 const rooms = new Map<string, RoomRecord>();
+const loginChallenges = new Map<string, QrLoginChallenge>();
 
 function getOrCreateRoom(rawRoomId: string): RoomRecord {
   const roomId = normalizeRoomCode(rawRoomId) || 'SYNC-42';
@@ -71,11 +75,101 @@ async function startServer() {
   const app = express();
   const server = http.createServer(app);
 
-  // Support up to 25MB payloads for base64 file/image/doc drops
   app.use(express.json({ limit: '25mb' }));
 
   app.get('/api/health', (_req, res) => {
     res.json({ status: 'ok', activeRooms: rooms.size });
+  });
+
+  // Register or refresh a QR Login / 6-Digit PIN challenge for desktop authentication
+  app.post('/api/auth/challenges', (req, res) => {
+    const challengeId =
+      String(req.body?.challengeId || '').trim() ||
+      `qr-auth-${Date.now()}`;
+    const pinCode = String(req.body?.pinCode || '482910').trim();
+    const roomId = normalizeRoomCode(String(req.body?.roomId || 'SYNC-42')) || 'SYNC-42';
+
+    const record: QrLoginChallenge = {
+      challengeId,
+      pinCode,
+      roomId,
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+    };
+    loginChallenges.set(challengeId, record);
+    res.status(201).json({ challenge: record });
+  });
+
+  // Approve a desktop QR Login challenge from phone
+  app.post('/api/auth/challenges/:challengeId/approve', (req, res) => {
+    const challengeId = req.params.challengeId;
+    const roomId =
+      normalizeRoomCode(String(req.body?.roomId || 'SYNC-42')) || 'SYNC-42';
+    const approvedByName =
+      String(req.body?.approvedByName || 'iPhone 16 Pro · QR Scan').trim();
+
+    const existing = loginChallenges.get(challengeId) || {
+      challengeId,
+      pinCode: String(req.body?.pinCode || '482910'),
+      roomId,
+      status: 'approved' as const,
+      createdAt: new Date().toISOString(),
+    };
+
+    existing.status = 'approved';
+    existing.roomId = roomId;
+    existing.approvedByName = approvedByName;
+    loginChallenges.set(challengeId, existing);
+
+    broadcastToRoom(roomId, {
+      type: 'auth:approved',
+      challenge: existing,
+    });
+
+    res.json({ challenge: existing });
+  });
+
+  // Verify a 6-digit pairing PIN code on desktop
+  app.post('/api/auth/pin-verify', (req, res) => {
+    const rawPin = String(req.body?.pinCode || '');
+    const roomId =
+      normalizeRoomCode(String(req.body?.roomId || 'SYNC-42')) || 'SYNC-42';
+    const validation = validatePinCode(rawPin);
+    if (!validation.valid) {
+      res.status(400).json({ error: validation.error });
+      return;
+    }
+
+    // Find matching challenge or accept valid 6-digit pairing PIN for the active room
+    let matchedRoom = roomId;
+    for (const [, ch] of loginChallenges) {
+      if (ch.pinCode === validation.cleaned) {
+        ch.status = 'approved';
+        matchedRoom = ch.roomId;
+        break;
+      }
+    }
+
+    const room = getOrCreateRoom(matchedRoom);
+    broadcastToRoom(room.roomId, {
+      type: 'auth:approved',
+      challenge: {
+        challengeId: `pin-${validation.cleaned}`,
+        pinCode: validation.cleaned,
+        roomId: room.roomId,
+        status: 'approved',
+        approvedByName: `6-Digit PIN (${validation.cleaned})`,
+        createdAt: new Date().toISOString(),
+      },
+    });
+
+    res.json({
+      authenticated: true,
+      method: 'pin',
+      pinCode: validation.cleaned,
+      roomId: room.roomId,
+      items: room.items,
+    });
   });
 
   // Get room state
@@ -102,7 +196,6 @@ async function startServer() {
     const itemId =
       body.id || `item-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
-    // Idempotency guard: if item with same ID already exists, return it
     const existing = room.items.find((i) => i.id === itemId);
     if (existing) {
       res.status(200).json({ item: existing });
@@ -128,10 +221,14 @@ async function startServer() {
           ? Math.round((body.dataUrl.length * 3) / 4)
           : Buffer.byteLength(resolvedContent, 'utf-8');
 
+    const retentionMode: RetentionMode =
+      body.retentionMode === 'temporary' ? 'temporary' : 'saved';
+
     const newItem: SharedItem = {
       id: itemId,
       roomId: room.roomId,
       category: validation.resolvedCategory,
+      retentionMode,
       title: defaultTitle,
       content: resolvedContent,
       fileName: body.fileName,
@@ -144,6 +241,7 @@ async function startServer() {
         (body.senderDevice === 'mobile' ? 'Mobile Handset' : 'Desktop Studio'),
       createdAt: new Date().toISOString(),
       pinned: false,
+      openedOnDesktop: false,
     };
 
     room.items.unshift(newItem);
@@ -172,6 +270,55 @@ async function startServer() {
     res.json({ item: target });
   });
 
+  // Toggle or set retentionMode ('temporary' <-> 'saved')
+  app.patch('/api/rooms/:roomId/items/:itemId/retention', (req, res) => {
+    const room = getOrCreateRoom(req.params.roomId);
+    const target = room.items.find((i) => i.id === req.params.itemId);
+    if (!target) {
+      res.status(404).json({ error: 'Item not found.' });
+      return;
+    }
+    const requested = req.body?.retentionMode;
+    target.retentionMode =
+      requested === 'temporary' || requested === 'saved'
+        ? requested
+        : target.retentionMode === 'temporary'
+          ? 'saved'
+          : 'temporary';
+    broadcastToRoom(room.roomId, {
+      type: 'item:updated',
+      item: target,
+    });
+    res.json({ item: target });
+  });
+
+  // Mark item as opened on desktop (and optionally auto-delete if temporary one-time link)
+  app.patch('/api/rooms/:roomId/items/:itemId/opened', (req, res) => {
+    const room = getOrCreateRoom(req.params.roomId);
+    const target = room.items.find((i) => i.id === req.params.itemId);
+    if (!target) {
+      res.status(404).json({ error: 'Item not found.' });
+      return;
+    }
+    target.openedOnDesktop = true;
+    const autoDeleteTemp = Boolean(req.body?.autoDeleteTemp);
+    if (autoDeleteTemp && target.retentionMode === 'temporary') {
+      room.items = room.items.filter((i) => i.id !== target.id);
+      broadcastToRoom(room.roomId, {
+        type: 'item:deleted',
+        itemId: target.id,
+      });
+      res.json({ deleted: true, itemId: target.id });
+      return;
+    }
+
+    broadcastToRoom(room.roomId, {
+      type: 'item:updated',
+      item: target,
+    });
+    res.json({ item: target });
+  });
+
   // Delete a specific item (idempotent)
   app.delete('/api/rooms/:roomId/items/:itemId', (req, res) => {
     const room = getOrCreateRoom(req.params.roomId);
@@ -184,11 +331,16 @@ async function startServer() {
     res.json({ deleted: true, itemId });
   });
 
-  // Clear unpinned items in room
+  // Clear unpinned or temporary items in room
   app.delete('/api/rooms/:roomId/items', (req, res) => {
     const room = getOrCreateRoom(req.params.roomId);
-    const keepPinned = req.query.keepPinned !== 'false';
-    room.items = keepPinned ? room.items.filter((i) => i.pinned) : [];
+    const mode = req.query.mode;
+    if (mode === 'temporary') {
+      room.items = room.items.filter((i) => i.retentionMode !== 'temporary');
+    } else {
+      const keepPinned = req.query.keepPinned !== 'false';
+      room.items = keepPinned ? room.items.filter((i) => i.pinned) : [];
+    }
     broadcastToRoom(room.roomId, {
       type: 'room:cleared',
       items: room.items,
@@ -224,10 +376,7 @@ async function startServer() {
           '_'
         );
         res.setHeader('Content-Type', mime);
-        res.setHeader(
-          'Content-Disposition',
-          `inline; filename="${safeName}"`
-        );
+        res.setHeader('Content-Disposition', `inline; filename="${safeName}"`);
         res.send(buffer);
         return;
       }
@@ -261,7 +410,6 @@ async function startServer() {
             msg.deviceName ||
             (deviceType === 'mobile' ? 'Mobile Handset' : 'Desktop Studio');
 
-          // Remove from previous room if switching rooms
           const prev = clients.get(ws);
           if (prev && prev.roomId !== room.roomId) {
             const oldRoom = rooms.get(prev.roomId);

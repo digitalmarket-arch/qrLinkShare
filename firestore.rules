@@ -1,0 +1,169 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 1: Global Default-Deny Catch-All
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidVaultItem(data, itemId) {
+      return data.keys().hasAll([
+        'id',
+        'ownerUid',
+        'roomId',
+        'category',
+        'retentionMode',
+        'title',
+        'content',
+        'sizeBytes',
+        'senderDevice',
+        'senderName',
+        'pinned',
+        'openedOnDesktop',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id',
+        'ownerUid',
+        'roomId',
+        'category',
+        'retentionMode',
+        'title',
+        'content',
+        'fileName',
+        'mimeType',
+        'sizeBytes',
+        'senderDevice',
+        'senderName',
+        'pinned',
+        'openedOnDesktop',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.id == itemId &&
+      isValidId(data.id) &&
+      data.ownerUid == request.auth.uid &&
+      isValidId(data.ownerUid) &&
+      data.roomId is string && data.roomId.size() >= 1 && data.roomId.size() <= 32 && data.roomId.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.category is string && data.category.size() <= 16 && (data.category in ['link', 'image', 'document', 'file', 'text']) &&
+      data.retentionMode is string && data.retentionMode.size() <= 16 && (data.retentionMode in ['temporary', 'saved']) &&
+      data.title is string && data.title.size() >= 1 && data.title.size() <= 200 &&
+      data.content is string && data.content.size() >= 1 && data.content.size() <= 50000 &&
+      (!('fileName' in data) || (data.fileName is string && data.fileName.size() <= 256)) &&
+      (!('mimeType' in data) || (data.mimeType is string && data.mimeType.size() <= 128)) &&
+      data.sizeBytes is number && data.sizeBytes >= 0 && data.sizeBytes <= 26214400 &&
+      data.senderDevice is string && data.senderDevice.size() <= 16 && (data.senderDevice in ['mobile', 'desktop']) &&
+      data.senderName is string && data.senderName.size() >= 1 && data.senderName.size() <= 100 &&
+      data.pinned is bool &&
+      data.openedOnDesktop is bool &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidLoginChallenge(data, challengeId) {
+      return data.keys().hasAll([
+        'challengeId',
+        'pinCode',
+        'status',
+        'approvedRoomId',
+        'approvedByUid',
+        'approvedByName',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'challengeId',
+        'pinCode',
+        'status',
+        'approvedRoomId',
+        'approvedByUid',
+        'approvedByName',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.challengeId == challengeId &&
+      isValidId(data.challengeId) &&
+      data.pinCode is string && data.pinCode.size() == 6 && data.pinCode.matches('^[0-9]{6}$') &&
+      data.status is string && data.status.size() <= 16 && (data.status in ['pending', 'approved', 'completed']) &&
+      data.approvedRoomId is string && data.approvedRoomId.size() >= 1 && data.approvedRoomId.size() <= 32 && data.approvedRoomId.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.approvedByUid == request.auth.uid &&
+      isValidId(data.approvedByUid) &&
+      data.approvedByName is string && data.approvedByName.size() >= 1 && data.approvedByName.size() <= 100 &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    match /vaultItems/{itemId} {
+      allow get: if isVerifiedUser() && isValidId(itemId) && existing().ownerUid == request.auth.uid;
+      allow list: if isVerifiedUser() && existing().ownerUid == request.auth.uid;
+
+      allow create: if isVerifiedUser() &&
+        isValidId(itemId) &&
+        isValidVaultItem(incoming(), itemId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser() &&
+        isValidId(itemId) &&
+        isValidVaultItem(incoming(), itemId) &&
+        existing().ownerUid == request.auth.uid &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().id == existing().id &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          incoming().diff(existing()).affectedKeys().hasOnly(['pinned', 'updatedAt']) ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['retentionMode', 'updatedAt']) ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['openedOnDesktop', 'updatedAt']) ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['title', 'pinned', 'retentionMode', 'openedOnDesktop', 'updatedAt'])
+        );
+
+      allow delete: if isVerifiedUser() && isValidId(itemId) && existing().ownerUid == request.auth.uid;
+    }
+
+    match /loginChallenges/{challengeId} {
+      allow get: if isVerifiedUser() && isValidId(challengeId) && existing().approvedByUid == request.auth.uid;
+      allow list: if isVerifiedUser() && existing().approvedByUid == request.auth.uid;
+
+      allow create: if isVerifiedUser() &&
+        isValidId(challengeId) &&
+        isValidLoginChallenge(incoming(), challengeId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser() &&
+        isValidId(challengeId) &&
+        isValidLoginChallenge(incoming(), challengeId) &&
+        existing().approvedByUid == request.auth.uid &&
+        existing().status != 'completed' &&
+        incoming().challengeId == existing().challengeId &&
+        incoming().approvedByUid == existing().approvedByUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['status', 'approvedRoomId', 'approvedByName', 'updatedAt']);
+
+      allow delete: if isVerifiedUser() && isValidId(challengeId) && existing().approvedByUid == request.auth.uid;
+    }
+  }
+}

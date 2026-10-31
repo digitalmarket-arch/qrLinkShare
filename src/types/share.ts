@@ -1,6 +1,10 @@
 export type ShareCategory = 'link' | 'image' | 'document' | 'file' | 'text';
 
+export type RetentionMode = 'temporary' | 'saved';
+
 export type DeviceType = 'desktop' | 'mobile';
+
+export type DesktopAuthMethod = 'qr' | 'pin' | 'google';
 
 export type ErrorCorrectionLevel = 'L' | 'M' | 'Q' | 'H';
 
@@ -8,6 +12,8 @@ export interface SharedItem {
   id: string;
   roomId: string;
   category: ShareCategory;
+  /** 'temporary' for ephemeral one-time link/drop, 'saved' for persistent vault links/data/docs */
+  retentionMode: RetentionMode;
   title: string;
   /** For 'link', the destination URL. For 'text', the text body. For files/images/docs, optional note/caption. */
   content: string;
@@ -24,6 +30,8 @@ export interface SharedItem {
   senderName: string;
   createdAt: string;
   pinned: boolean;
+  /** Tracks whether this item has been auto-opened or launched in the desktop browser */
+  openedOnDesktop?: boolean;
 }
 
 export interface ConnectedDevice {
@@ -36,6 +44,7 @@ export interface ConnectedDevice {
 export interface CreateShareItemPayload {
   id?: string;
   category?: ShareCategory;
+  retentionMode?: RetentionMode;
   title?: string;
   content?: string;
   fileName?: string;
@@ -44,6 +53,24 @@ export interface CreateShareItemPayload {
   dataUrl?: string;
   senderDevice: DeviceType;
   senderName: string;
+}
+
+export interface DesktopAuthSession {
+  authenticated: boolean;
+  method: DesktopAuthMethod;
+  userLabel: string;
+  userEmail?: string;
+  roomId: string;
+  authenticatedAt: string;
+}
+
+export interface QrLoginChallenge {
+  challengeId: string;
+  pinCode: string;
+  roomId: string;
+  status: 'pending' | 'approved';
+  approvedByName?: string;
+  createdAt: string;
 }
 
 export interface RoomState {

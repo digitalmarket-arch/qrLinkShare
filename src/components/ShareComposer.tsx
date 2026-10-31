@@ -8,10 +8,13 @@ import {
   Smartphone,
   Monitor,
   FileSpreadsheet,
+  Clock,
+  Bookmark,
 } from 'lucide-react';
 import {
   CreateShareItemPayload,
   DeviceType,
+  RetentionMode,
   ShareCategory,
 } from '../types/share';
 import {
@@ -27,14 +30,16 @@ interface ShareComposerProps {
   onShareItem: (payload: CreateShareItemPayload) => Promise<void>;
 }
 
-type ComposerTab = 'upload' | 'link' | 'text';
+type ComposerTab = 'link' | 'upload' | 'text';
 
 export const ShareComposer: React.FC<ShareComposerProps> = ({
   roomId,
   defaultDevice,
   onShareItem,
 }) => {
-  const [activeTab, setActiveTab] = useState<ComposerTab>('upload');
+  const [activeTab, setActiveTab] = useState<ComposerTab>('link');
+  const [retentionMode, setRetentionMode] =
+    useState<RetentionMode>('temporary');
   const [senderDevice, setSenderDevice] = useState<DeviceType>(defaultDevice);
   const [senderName, setSenderName] = useState<string>(
     defaultDevice === 'mobile' ? 'iPhone 16 Pro · Mobile' : 'Desktop Studio'
@@ -138,6 +143,7 @@ export const ShareComposer: React.FC<ShareComposerProps> = ({
           fileName: sample.fileName,
           mimeType: sample.mimeType,
         }),
+        retentionMode,
         title: sample.title,
         content: sample.content,
         fileName: sample.fileName,
@@ -147,7 +153,9 @@ export const ShareComposer: React.FC<ShareComposerProps> = ({
         senderDevice,
         senderName,
       });
-      setStatusFeedback(`Beamed "${sample.fileName}" to room ${roomId}`);
+      setStatusFeedback(
+        `Shared "${sample.fileName}" (${retentionMode === 'temporary' ? 'Temporary Drop' : 'Saved Vault'})`
+      );
       setTimeout(() => setStatusFeedback(null), 2500);
     } catch (err) {
       setErrorMsg(
@@ -168,6 +176,7 @@ export const ShareComposer: React.FC<ShareComposerProps> = ({
     if (activeTab === 'link') {
       payload = {
         category: 'link',
+        retentionMode,
         title: linkTitle.trim(),
         content: linkUrl.trim(),
         senderDevice,
@@ -176,7 +185,8 @@ export const ShareComposer: React.FC<ShareComposerProps> = ({
     } else if (activeTab === 'text') {
       payload = {
         category: 'text',
-        title: textTitle.trim() || 'Shared Note / Snippet',
+        retentionMode,
+        title: textTitle.trim() || 'Shared Note / Data Snippet',
         content: textBody.trim(),
         senderDevice,
         senderName,
@@ -188,6 +198,7 @@ export const ShareComposer: React.FC<ShareComposerProps> = ({
       }
       payload = {
         category: selectedFile.category,
+        retentionMode,
         title: fileCaption.trim() || selectedFile.fileName,
         content: `Shared ${selectedFile.category} (${selectedFile.fileName})`,
         fileName: selectedFile.fileName,
@@ -211,6 +222,7 @@ export const ShareComposer: React.FC<ShareComposerProps> = ({
         ...payload,
         content: validation.normalizedUrl ?? payload.content,
         category: validation.resolvedCategory ?? payload.category,
+        retentionMode: validation.resolvedRetention ?? retentionMode,
       });
 
       if (activeTab === 'link') {
@@ -227,7 +239,9 @@ export const ShareComposer: React.FC<ShareComposerProps> = ({
         }
       }
 
-      setStatusFeedback(`Sent to room ${roomId}`);
+      setStatusFeedback(
+        `Shared to ${roomId} as ${retentionMode === 'temporary' ? 'Temporary Link/Drop' : 'Saved Vault Item'}`
+      );
       setTimeout(() => setStatusFeedback(null), 2500);
     } catch (err) {
       setErrorMsg(
@@ -243,16 +257,16 @@ export const ShareComposer: React.FC<ShareComposerProps> = ({
       aria-labelledby="composer-heading"
       className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5"
     >
-      <div className="flex items-center justify-between gap-2 mb-4 flex-wrap">
+      <div className="flex items-center justify-between gap-2 mb-3 flex-wrap">
         <div>
           <h2
             id="composer-heading"
             className="text-base font-semibold text-slate-900 dark:text-slate-100"
           >
-            Instant Beam Composer
+            Share Link, Doc, or Data to Desktop
           </h2>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-            Send files, images, PDFs/docs, links, or text to Room {roomId}
+            Choose Temporary Link or Saved Vault for Room {roomId}
           </p>
         </div>
 
@@ -289,30 +303,50 @@ export const ShareComposer: React.FC<ShareComposerProps> = ({
         </div>
       </div>
 
+      {/* Dual Retention Mode Selector (Option 1: Temporary Link vs Option 2: Saved Links/Data/Doc) */}
+      <div className="mb-3">
+        <span className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">
+          Storage & Retention Mode
+        </span>
+        <div
+          role="group"
+          aria-label="Storage and retention mode"
+          className="grid grid-cols-2 gap-1.5 p-1 bg-slate-100 dark:bg-slate-800 rounded-lg"
+        >
+          <button
+            type="button"
+            onClick={() => setRetentionMode('temporary')}
+            className={`min-h-[40px] px-2.5 py-1.5 text-xs font-medium rounded-md transition-colors flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer ${
+              retentionMode === 'temporary'
+                ? 'bg-white dark:bg-slate-900 text-amber-700 dark:text-amber-400 shadow-2xs font-semibold'
+                : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+            }`}
+          >
+            <Clock className="w-3.5 h-3.5 shrink-0" />
+            <span>Temporary Link / Drop</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setRetentionMode('saved')}
+            className={`min-h-[40px] px-2.5 py-1.5 text-xs font-medium rounded-md transition-colors flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer ${
+              retentionMode === 'saved'
+                ? 'bg-white dark:bg-slate-900 text-indigo-700 dark:text-indigo-400 shadow-2xs font-semibold'
+                : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+            }`}
+          >
+            <Bookmark className="w-3.5 h-3.5 shrink-0" />
+            <span>Saved Link / Data / Doc</span>
+          </button>
+        </div>
+      </div>
+
       {/* Mode Tabs */}
       <div
         role="tablist"
         aria-label="Share payload type"
         className="grid grid-cols-3 gap-1 p-1 bg-slate-100 dark:bg-slate-800 rounded-lg mb-4"
       >
-        <button
-          type="button"
-          role="tab"
-          aria-selected={activeTab === 'upload'}
-          onClick={() => {
-            setActiveTab('upload');
-            setErrorMsg(null);
-          }}
-          className={`min-h-[42px] px-2 py-1.5 text-xs font-medium rounded-md transition-colors flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer ${
-            activeTab === 'upload'
-              ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-2xs'
-              : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
-          }`}
-        >
-          <Upload className="w-3.5 h-3.5 shrink-0" />
-          <span>Files & Docs</span>
-        </button>
-
         <button
           type="button"
           role="tab"
@@ -334,6 +368,24 @@ export const ShareComposer: React.FC<ShareComposerProps> = ({
         <button
           type="button"
           role="tab"
+          aria-selected={activeTab === 'upload'}
+          onClick={() => {
+            setActiveTab('upload');
+            setErrorMsg(null);
+          }}
+          className={`min-h-[42px] px-2 py-1.5 text-xs font-medium rounded-md transition-colors flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer ${
+            activeTab === 'upload'
+              ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-2xs'
+              : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+          }`}
+        >
+          <Upload className="w-3.5 h-3.5 shrink-0" />
+          <span>Files & Docs</span>
+        </button>
+
+        <button
+          type="button"
+          role="tab"
           aria-selected={activeTab === 'text'}
           onClick={() => {
             setActiveTab('text');
@@ -346,11 +398,52 @@ export const ShareComposer: React.FC<ShareComposerProps> = ({
           }`}
         >
           <FileText className="w-3.5 h-3.5 shrink-0" />
-          <span>Text / Note</span>
+          <span>Text / Data</span>
         </button>
       </div>
 
       <form onSubmit={handleSubmit} noValidate className="space-y-3">
+        {activeTab === 'link' && (
+          <div className="space-y-3">
+            <div>
+              <label
+                htmlFor="share-link-url"
+                className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
+              >
+                Destination URL (Opens in Desktop Browser)
+              </label>
+              <input
+                id="share-link-url"
+                type="url"
+                value={linkUrl}
+                onChange={(e) => {
+                  setLinkUrl(e.target.value);
+                  if (errorMsg) setErrorMsg(null);
+                }}
+                placeholder="https://figma.com/file/mobile-handoff"
+                className="w-full min-h-[40px] px-3 py-2 text-xs font-mono bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-lg text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="share-link-title"
+                className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
+              >
+                Link Label (Optional)
+              </label>
+              <input
+                id="share-link-title"
+                type="text"
+                value={linkTitle}
+                onChange={(e) => setLinkTitle(e.target.value)}
+                placeholder="e.g. Design System Prototype v4"
+                className="w-full min-h-[40px] px-3 py-2 text-xs bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-lg text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              />
+            </div>
+          </div>
+        )}
+
         {activeTab === 'upload' && (
           <div>
             <input
@@ -476,47 +569,6 @@ export const ShareComposer: React.FC<ShareComposerProps> = ({
           </div>
         )}
 
-        {activeTab === 'link' && (
-          <div className="space-y-3">
-            <div>
-              <label
-                htmlFor="share-link-url"
-                className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
-              >
-                Destination URL
-              </label>
-              <input
-                id="share-link-url"
-                type="url"
-                value={linkUrl}
-                onChange={(e) => {
-                  setLinkUrl(e.target.value);
-                  if (errorMsg) setErrorMsg(null);
-                }}
-                placeholder="https://figma.com/file/mobile-handoff"
-                className="w-full min-h-[40px] px-3 py-2 text-xs font-mono bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-lg text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              />
-            </div>
-
-            <div>
-              <label
-                htmlFor="share-link-title"
-                className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
-              >
-                Link Label (Optional)
-              </label>
-              <input
-                id="share-link-title"
-                type="text"
-                value={linkTitle}
-                onChange={(e) => setLinkTitle(e.target.value)}
-                placeholder="e.g. Design System Prototype v4"
-                className="w-full min-h-[40px] px-3 py-2 text-xs bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-lg text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              />
-            </div>
-          </div>
-        )}
-
         {activeTab === 'text' && (
           <div className="space-y-3">
             <div>
@@ -541,7 +593,7 @@ export const ShareComposer: React.FC<ShareComposerProps> = ({
                 htmlFor="share-text-body"
                 className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
               >
-                Text / Clipboard Payload
+                Text / Data Payload
               </label>
               <textarea
                 id="share-text-body"
@@ -551,7 +603,7 @@ export const ShareComposer: React.FC<ShareComposerProps> = ({
                   setTextBody(e.target.value);
                   if (errorMsg) setErrorMsg(null);
                 }}
-                placeholder="Paste text, terminal command, address, or code snippet to beam across devices..."
+                placeholder="Paste text, terminal command, JSON data, or code snippet..."
                 className="w-full px-3 py-2 text-xs font-mono bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-lg text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500"
               />
             </div>
@@ -584,12 +636,18 @@ export const ShareComposer: React.FC<ShareComposerProps> = ({
           <Send className="w-3.5 h-3.5" />
           <span>
             {isSubmitting
-              ? 'Beaming to Room...'
+              ? 'Sending...'
               : activeTab === 'link'
-                ? 'Share Link to Room'
+                ? retentionMode === 'temporary'
+                  ? 'Share Temporary Link to Desktop'
+                  : 'Save Link to Vault'
                 : activeTab === 'text'
-                  ? 'Share Text Snippet to Room'
-                  : 'Beam File to Room'}
+                  ? retentionMode === 'temporary'
+                    ? 'Share Temporary Note'
+                    : 'Save Data / Note to Vault'
+                  : retentionMode === 'temporary'
+                    ? 'Beam Temporary File'
+                    : 'Save File / Doc to Vault'}
           </span>
         </button>
       </form>

@@ -10,17 +10,25 @@ import { QrCodeView } from './QrCodeView';
 interface ItemQrModalProps {
   item: SharedItem | null;
   onClose: () => void;
+  isStaticHost?: boolean;
 }
 
-export const ItemQrModal: React.FC<ItemQrModalProps> = ({ item, onClose }) => {
+export const ItemQrModal: React.FC<ItemQrModalProps> = ({
+  item,
+  onClose,
+  isStaticHost = false,
+}) => {
   if (!item) return null;
 
-  const origin =
+  const baseUrl =
     typeof window !== 'undefined'
-      ? window.location.origin
-      : 'http://localhost:3000';
-  const qrPayload = buildItemDirectSharePayload(item, origin);
-  const downloadHref = `/api/rooms/${encodeURIComponent(item.roomId)}/items/${encodeURIComponent(item.id)}/download`;
+      ? `${window.location.origin}${window.location.pathname}`
+      : 'http://localhost:3000/';
+  const qrPayload = buildItemDirectSharePayload(item, baseUrl, isStaticHost);
+  const downloadHref =
+    item.dataUrl && item.dataUrl.startsWith('data:')
+      ? item.dataUrl
+      : `data:text/plain;charset=utf-8,${encodeURIComponent(item.content)}`;
 
   return (
     <div

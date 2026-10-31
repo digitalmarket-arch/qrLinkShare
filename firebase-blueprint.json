@@ -1,0 +1,186 @@
+{
+  "entities": {
+    "VaultItem": {
+      "title": "VaultItem",
+      "description": "A shared link, document, image, file, or text item stored in a user vault with temporary or saved retention.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique item identifier"
+        },
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the authenticated user owning the item"
+        },
+        "roomId": {
+          "type": "string",
+          "maxLength": 32,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Associated room or session identifier"
+        },
+        "category": {
+          "type": "string",
+          "enum": ["link", "image", "document", "file", "text"],
+          "maxLength": 16,
+          "description": "Item payload category"
+        },
+        "retentionMode": {
+          "type": "string",
+          "enum": ["temporary", "saved"],
+          "maxLength": 16,
+          "description": "Whether the item is a temporary link/drop or permanently saved link/data/doc"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Human-readable item label"
+        },
+        "content": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 50000,
+          "description": "Destination URL or text payload"
+        },
+        "fileName": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "Optional filename for uploaded documents or files"
+        },
+        "mimeType": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Optional MIME type string"
+        },
+        "sizeBytes": {
+          "type": "number",
+          "description": "Size of payload in bytes"
+        },
+        "senderDevice": {
+          "type": "string",
+          "enum": ["mobile", "desktop"],
+          "maxLength": 16,
+          "description": "Originating device class"
+        },
+        "senderName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "Display name of sender device"
+        },
+        "pinned": {
+          "type": "boolean",
+          "description": "Whether item is pinned to the top of the stream"
+        },
+        "openedOnDesktop": {
+          "type": "boolean",
+          "description": "Whether this item has already been auto-opened or launched on desktop"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp"
+        }
+      },
+      "required": [
+        "id",
+        "ownerUid",
+        "roomId",
+        "category",
+        "retentionMode",
+        "title",
+        "content",
+        "sizeBytes",
+        "senderDevice",
+        "senderName",
+        "pinned",
+        "openedOnDesktop",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "LoginChallenge": {
+      "title": "LoginChallenge",
+      "description": "A QR-code or 6-digit PIN desktop login challenge approved by an authenticated phone user.",
+      "type": "object",
+      "properties": {
+        "challengeId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique QR login challenge ID"
+        },
+        "pinCode": {
+          "type": "string",
+          "minLength": 6,
+          "maxLength": 6,
+          "pattern": "^[0-9]{6}$",
+          "description": "6-digit numeric pairing PIN"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "approved", "completed"],
+          "maxLength": 16,
+          "description": "Handshake lifecycle status"
+        },
+        "approvedRoomId": {
+          "type": "string",
+          "maxLength": 32,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Approved vault/room identifier"
+        },
+        "approvedByUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the user who approved the desktop login"
+        },
+        "approvedByName": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Display label of approver"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp"
+        }
+      },
+      "required": [
+        "challengeId",
+        "pinCode",
+        "status",
+        "approvedRoomId",
+        "approvedByUid",
+        "approvedByName",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/vaultItems/{itemId}": {
+      "schema": "VaultItem",
+      "description": "Stores shared links, documents, files, and snippets with temporary or saved retention."
+    },
+    "/loginChallenges/{challengeId}": {
+      "schema": "LoginChallenge",
+      "description": "Stores QR-code and 6-digit PIN desktop login handshakes."
+    }
+  }
+}

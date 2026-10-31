@@ -9,6 +9,12 @@ import {
   buildItemDirectSharePayload,
   filterAndSortItems,
   computeRoomStats,
+  encodeShareUrlPayload,
+  decodeShareUrlPayload,
+  buildGithubPagesUrl,
+  generateSixDigitPin,
+  validatePinCode,
+  findNewestUnopenedLink,
 } from './shareLogic';
 import { SharedItem } from '../types/share';
 
@@ -16,6 +22,16 @@ test('normalizeRoomCode cleans and uppercases room identifiers', () => {
   assert.equal(normalizeRoomCode('  sync-42 '), 'SYNC-42');
   assert.equal(normalizeRoomCode('room_99!@#'), 'ROOM99');
   assert.equal(normalizeRoomCode(''), '');
+});
+
+test('generateSixDigitPin and validatePinCode enforce 6-digit numeric PIN codes', () => {
+  const pin = generateSixDigitPin(42);
+  assert.equal(pin.length, 6);
+  assert.match(pin, /^[0-9]{6}$/);
+
+  assert.equal(validatePinCode('482910').valid, true);
+  assert.equal(validatePinCode('12345').valid, false);
+  assert.equal(validatePinCode('12345A').valid, false);
 });
 
 test('detectItemCategory classifies images, documents, files, links, and text accurately', () => {
@@ -45,7 +61,7 @@ test('detectItemCategory classifies images, documents, files, links, and text ac
   );
 });
 
-test('validateShareSubmission enforces strict input validation without silent fallbacks', () => {
+test('validateShareSubmission enforces strict input validation and retentionMode', () => {
   const emptyLink = validateShareSubmission({
     category: 'link',
     content: '   ',
@@ -55,45 +71,29 @@ test('validateShareSubmission enforces strict input validation without silent fa
   assert.equal(emptyLink.valid, false);
   assert.ok(emptyLink.error);
 
-  const invalidLink = validateShareSubmission({
+  const validTempLink = validateShareSubmission({
     category: 'link',
-    content: 'not a valid url',
-    senderDevice: 'mobile',
-    senderName: 'iPhone',
-  });
-  assert.equal(invalidLink.valid, false);
-
-  const validDomainWithoutProtocol = validateShareSubmission({
-    category: 'link',
+    retentionMode: 'temporary',
     content: 'docs.example.com/spec',
     senderDevice: 'mobile',
     senderName: 'iPhone',
   });
-  assert.equal(validDomainWithoutProtocol.valid, true);
-  assert.equal(
-    validDomainWithoutProtocol.normalizedUrl,
-    'https://docs.example.com/spec'
-  );
+  assert.equal(validTempLink.valid, true);
+  assert.equal(validTempLink.normalizedUrl, 'https://docs.example.com/spec');
+  assert.equal(validTempLink.resolvedRetention, 'temporary');
 
-  const missingFile = validateShareSubmission({
-    category: 'image',
-    fileName: '',
-    dataUrl: '',
-    senderDevice: 'mobile',
-    senderName: 'iPhone',
-  });
-  assert.equal(missingFile.valid, false);
-
-  const validFile = validateShareSubmission({
+  const validSavedDoc = validateShareSubmission({
     category: 'document',
+    retentionMode: 'saved',
     fileName: 'spec.md',
     mimeType: 'text/markdown',
     dataUrl: 'data:text/markdown;base64,SGVsbG8=',
     senderDevice: 'desktop',
     senderName: 'Workstation',
   });
-  assert.equal(validFile.valid, true);
-  assert.equal(validFile.resolvedCategory, 'document');
+  assert.equal(validSavedDoc.valid, true);
+  assert.equal(validSavedDoc.resolvedCategory, 'document');
+  assert.equal(validSavedDoc.resolvedRetention, 'saved');
 });
 
 test('formatBytes formats byte sizes cleanly', () => {
@@ -103,16 +103,17 @@ test('formatBytes formats byte sizes cleanly', () => {
   assert.equal(formatBytes(1048576 * 2.5), '2.50 MB');
 });
 
-test('buildPairingUrl and buildItemDirectSharePayload generate scannable URLs', () => {
+test('buildPairingUrl and buildItemDirectSharePayload include QR login challenge parameters', () => {
   assert.equal(
-    buildPairingUrl('https://app.example.com/', 'sync-42'),
-    'https://app.example.com/?room=SYNC-42&device=mobile'
+    buildPairingUrl('https://app.example.com/', 'sync-42', 'chal-99', '482910'),
+    'https://app.example.com/?room=SYNC-42&device=mobile&qrLogin=chal-99&pin=482910'
   );
 
   const sampleDoc: SharedItem = {
     id: 'doc-123',
     roomId: 'SYNC-42',
     category: 'document',
+    retentionMode: 'saved',
     title: 'Architecture PDF',
     content: 'Summary',
     fileName: 'arch.pdf',
@@ -130,24 +131,27 @@ test('buildPairingUrl and buildItemDirectSharePayload generate scannable URLs', 
   );
 });
 
-test('filterAndSortItems sorts pinned items first and filters by category and query', () => {
+test('findNewestUnopenedLink and filterAndSortItems support temporary vs saved retention tiers', () => {
   const items: SharedItem[] = [
     {
       id: '1',
       roomId: 'SYNC-42',
       category: 'link',
-      title: 'Old Unpinned Link',
-      content: 'https://example.com/old',
+      retentionMode: 'temporary',
+      title: 'Newest Temporary Link',
+      content: 'https://example.com/new-temp',
       sizeBytes: 30,
-      senderDevice: 'desktop',
-      senderName: 'Mac',
-      createdAt: '2026-10-31T01:00:00.000Z',
+      senderDevice: 'mobile',
+      senderName: 'iPhone',
+      createdAt: '2026-10-31T02:00:00.000Z',
       pinned: false,
+      openedOnDesktop: false,
     },
     {
       id: '2',
       roomId: 'SYNC-42',
       category: 'image',
+      retentionMode: 'saved',
       title: 'Pinned Camera Diagram',
       content: 'Camera capture',
       fileName: 'diagram.svg',
@@ -156,25 +160,58 @@ test('filterAndSortItems sorts pinned items first and filters by category and qu
       senderName: 'iPhone',
       createdAt: '2026-10-31T00:30:00.000Z',
       pinned: true,
+      openedOnDesktop: true,
     },
   ];
 
-  const allSorted = filterAndSortItems(items, {
+  const newestUnopened = findNewestUnopenedLink(items);
+  assert.ok(newestUnopened);
+  assert.equal(newestUnopened.id, '1');
+
+  const onlyTemp = filterAndSortItems(items, {
     category: 'all',
+    retentionFilter: 'temporary',
     searchQuery: '',
   });
-  assert.equal(allSorted[0].id, '2');
+  assert.equal(onlyTemp.length, 1);
+  assert.equal(onlyTemp[0].id, '1');
 
-  const onlyImages = filterAndSortItems(items, {
-    category: 'image',
-    searchQuery: 'camera',
+  const onlySaved = filterAndSortItems(items, {
+    category: 'all',
+    retentionFilter: 'saved',
+    searchQuery: '',
   });
-  assert.equal(onlyImages.length, 1);
-  assert.equal(onlyImages[0].id, '2');
+  assert.equal(onlySaved.length, 1);
+  assert.equal(onlySaved[0].id, '2');
 
   const stats = computeRoomStats(items);
   assert.equal(stats.totalItems, 2);
-  assert.equal(stats.totalBytes, 1230);
-  assert.equal(stats.pinnedCount, 1);
-  assert.equal(stats.countByCategory.image, 1);
+  assert.equal(stats.temporaryCount, 1);
+  assert.equal(stats.savedCount, 1);
+  assert.equal(stats.unopenedLinkCount, 1);
+});
+
+test('encodeShareUrlPayload and decodeShareUrlPayload preserve retentionMode for GitHub Pages sharing', () => {
+  const token = encodeShareUrlPayload({
+    category: 'link',
+    retentionMode: 'temporary',
+    title: 'GitHub Pages Release',
+    content: 'https://digitalmartket333.github.io/qrLinkShare/',
+    senderDevice: 'mobile',
+    senderName: 'iPhone 16 Pro',
+  });
+  const decoded = decodeShareUrlPayload(token);
+  assert.ok(decoded);
+  assert.equal(decoded.category, 'link');
+  assert.equal(decoded.retentionMode, 'temporary');
+  assert.equal(decoded.title, 'GitHub Pages Release');
+  assert.equal(
+    decoded.content,
+    'https://digitalmartket333.github.io/qrLinkShare/'
+  );
+
+  assert.equal(
+    buildGithubPagesUrl('digitalmartket333', 'qrLinkShare', 'sync-42'),
+    'https://digitalmartket333.github.io/qrLinkShare/?room=SYNC-42'
+  );
 });

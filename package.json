@@ -12,6 +12,7 @@
   "dependencies": {
     "@tailwindcss/vite": "^4.1.14",
     "express": "^4.21.2",
+    "firebase": "^13.1.0",
     "lucide-react": "^0.546.0",
     "qrcode": "^1.5.4",
     "react": "^19.0.0",

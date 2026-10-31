@@ -1,6 +1,7 @@
 import {
   CreateShareItemPayload,
   DeviceType,
+  RetentionMode,
   ShareCategory,
   SharedItem,
 } from '../types/share';
@@ -45,6 +46,36 @@ export function generateRoomCode(seed?: number): string {
     suffix += digits[idx];
   }
   return `${prefix}-${suffix}`;
+}
+
+/**
+ * Generates a deterministic or random 6-digit numeric pairing PIN (e.g. "482910").
+ */
+export function generateSixDigitPin(seed?: number): string {
+  if (seed !== undefined) {
+    const val = Math.abs(Math.floor(seed * 193871 + 482910)) % 900000;
+    return String(100000 + val);
+  }
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+/**
+ * Validates a 6-digit pairing PIN entered by the user.
+ */
+export function validatePinCode(input: string): {
+  valid: boolean;
+  cleaned: string;
+  error?: string;
+} {
+  const cleaned = input.replace(/\s+/g, '').trim();
+  if (!/^[0-9]{6}$/.test(cleaned)) {
+    return {
+      valid: false,
+      cleaned,
+      error: 'Enter a valid 6-digit numeric pairing PIN (for example, 482910).',
+    };
+  }
+  return { valid: true, cleaned };
 }
 
 /**
@@ -103,6 +134,7 @@ export function validateShareSubmission(payload: CreateShareItemPayload): {
   error?: string;
   normalizedUrl?: string;
   resolvedCategory?: ShareCategory;
+  resolvedRetention?: RetentionMode;
 } {
   const category = detectItemCategory({
     explicitCategory: payload.category,
@@ -110,6 +142,9 @@ export function validateShareSubmission(payload: CreateShareItemPayload): {
     fileName: payload.fileName,
     content: payload.content,
   });
+
+  const resolvedRetention: RetentionMode =
+    payload.retentionMode === 'temporary' ? 'temporary' : 'saved';
 
   if (category === 'link') {
     const raw = (payload.content ?? '').trim();
@@ -149,6 +184,7 @@ export function validateShareSubmission(payload: CreateShareItemPayload): {
         valid: true,
         normalizedUrl: parsed.toString(),
         resolvedCategory: 'link',
+        resolvedRetention,
       };
     } catch {
       return {
@@ -169,10 +205,10 @@ export function validateShareSubmission(payload: CreateShareItemPayload): {
     return {
       valid: true,
       resolvedCategory: 'text',
+      resolvedRetention,
     };
   }
 
-  // Image, Document, or File upload
   if (!payload.fileName || !payload.dataUrl) {
     return {
       valid: false,
@@ -190,6 +226,7 @@ export function validateShareSubmission(payload: CreateShareItemPayload): {
   return {
     valid: true,
     resolvedCategory: category,
+    resolvedRetention,
   };
 }
 
@@ -206,56 +243,93 @@ export function formatBytes(bytes: number): string {
 }
 
 /**
- * Builds the Phone-to-Desktop pairing URL encoded in the room QR code.
+ * Builds the Phone-to-Desktop pairing & QR login URL encoded in the desktop QR code.
+ * Preserves repository subpaths (e.g. https://user.github.io/qrLinkShare/) for GitHub Pages.
  */
-export function buildPairingUrl(origin: string, roomCode: string): string {
-  const cleanOrigin = origin.replace(/\/$/, '');
+export function buildPairingUrl(
+  originOrBaseUrl: string,
+  roomCode: string,
+  challengeId?: string,
+  pinCode?: string
+): string {
+  const cleanBase = originOrBaseUrl
+    .replace(/\?.*$/, '')
+    .replace(/#.*$/, '')
+    .replace(/\/$/, '');
   const code = normalizeRoomCode(roomCode) || 'SYNC-42';
-  return `${cleanOrigin}/?room=${encodeURIComponent(code)}&device=mobile`;
+  let url = `${cleanBase}/?room=${encodeURIComponent(code)}&device=mobile`;
+  if (challengeId) {
+    url += `&qrLogin=${encodeURIComponent(challengeId)}`;
+  }
+  if (pinCode) {
+    url += `&pin=${encodeURIComponent(pinCode)}`;
+  }
+  return url;
 }
 
 /**
  * Builds the direct payload for an individual shared item's QR code so scanning it on a phone
- * immediately opens the link, downloads the file/image/doc, or reads the text.
+ * immediately opens the link, reads the text, or opens/downloads the shared item.
  */
 export function buildItemDirectSharePayload(
   item: SharedItem,
-  origin: string
+  originOrBaseUrl: string,
+  isStaticHost = false
 ): string {
-  const cleanOrigin = origin.replace(/\/$/, '');
+  const cleanBase = originOrBaseUrl
+    .replace(/\?.*$/, '')
+    .replace(/#.*$/, '')
+    .replace(/\/$/, '');
   if (item.category === 'link') {
     return item.content;
   }
-  if (
-    item.category === 'image' ||
-    item.category === 'document' ||
-    item.category === 'file'
-  ) {
-    return `${cleanOrigin}/api/rooms/${encodeURIComponent(item.roomId)}/items/${encodeURIComponent(item.id)}/download`;
-  }
-  // For short text, encode directly; if very long, point to download/raw endpoint
-  if (item.content.length <= 600) {
+  if (item.category === 'text' && item.content.length <= 600) {
     return item.content;
   }
-  return `${cleanOrigin}/api/rooms/${encodeURIComponent(item.roomId)}/items/${encodeURIComponent(item.id)}/download`;
+  if (isStaticHost) {
+    const token = encodeShareUrlPayload(item);
+    return `${cleanBase}/?room=${encodeURIComponent(item.roomId)}#share=${token}`;
+  }
+  return `${cleanBase}/api/rooms/${encodeURIComponent(item.roomId)}/items/${encodeURIComponent(item.id)}/download`;
 }
 
 /**
- * Filters and sorts shared items (pinned first, then newest first).
+ * Finds the newest shared link that has not yet been auto-opened on desktop.
+ */
+export function findNewestUnopenedLink(items: SharedItem[]): SharedItem | null {
+  const links = items
+    .filter((i) => i.category === 'link' && !i.openedOnDesktop)
+    .sort(
+      (a, b) =>
+        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+  return links[0] ?? null;
+}
+
+/**
+ * Filters and sorts shared items (pinned first, then newest first) including retentionMode filtering.
  */
 export function filterAndSortItems(
   items: SharedItem[],
   options: {
     category: 'all' | 'pinned' | ShareCategory;
+    retentionFilter?: 'all' | RetentionMode;
     searchQuery: string;
     deviceFilter?: 'all' | DeviceType;
   }
 ): SharedItem[] {
   const query = options.searchQuery.trim().toLowerCase();
   const deviceFilter = options.deviceFilter ?? 'all';
+  const retentionFilter = options.retentionFilter ?? 'all';
 
   return items
     .filter((item) => {
+      if (
+        retentionFilter !== 'all' &&
+        (item.retentionMode || 'saved') !== retentionFilter
+      ) {
+        return false;
+      }
       if (options.category === 'pinned' && !item.pinned) return false;
       if (
         options.category !== 'all' &&
@@ -275,6 +349,7 @@ export function filterAndSortItems(
         item.mimeType ?? '',
         item.senderName,
         item.category,
+        item.retentionMode ?? 'saved',
       ]
         .join(' ')
         .toLowerCase();
@@ -289,12 +364,115 @@ export function filterAndSortItems(
 }
 
 /**
- * Computes summary counts and total byte size for a room.
+ * Encodes a lightweight share item into a URL-safe base64 token so QR codes on static hosts (GitHub Pages)
+ * can beam links, text, and metadata directly via URL hash (#share=...) without a backend server.
+ */
+export function encodeShareUrlPayload(
+  item: Pick<
+    SharedItem,
+    | 'category'
+    | 'retentionMode'
+    | 'title'
+    | 'content'
+    | 'fileName'
+    | 'mimeType'
+    | 'senderDevice'
+    | 'senderName'
+  >
+): string {
+  const compact = {
+    c: item.category,
+    r: item.retentionMode || 'saved',
+    t: item.title.slice(0, 100),
+    v: item.content.slice(0, 1200),
+    f: item.fileName,
+    m: item.mimeType,
+    d: item.senderDevice,
+    s: item.senderName.slice(0, 40),
+  };
+  const json = JSON.stringify(compact);
+  if (typeof Buffer !== 'undefined') {
+    return Buffer.from(json, 'utf-8').toString('base64url');
+  }
+  const base64 = btoa(
+    encodeURIComponent(json).replace(/%([0-9A-F]{2})/g, (_m, p1) =>
+      String.fromCharCode(parseInt(p1, 16))
+    )
+  );
+  return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/**
+ * Decodes a URL-safe base64 share token from #share=... into a CreateShareItemPayload.
+ */
+export function decodeShareUrlPayload(
+  token: string
+): CreateShareItemPayload | null {
+  try {
+    const cleaned = token.trim();
+    if (!cleaned) return null;
+    let json = '';
+    if (typeof Buffer !== 'undefined') {
+      json = Buffer.from(cleaned, 'base64url').toString('utf-8');
+    } else {
+      const base64 = cleaned.replace(/-/g, '+').replace(/_/g, '/');
+      const padded = base64 + '==='.slice((base64.length + 3) % 4);
+      const binary = atob(padded);
+      json = decodeURIComponent(
+        Array.from(binary)
+          .map((ch) => '%' + ch.charCodeAt(0).toString(16).padStart(2, '0'))
+          .join('')
+      );
+    }
+    const parsed = JSON.parse(json);
+    if (!parsed || typeof parsed.v !== 'string') return null;
+    return {
+      category: parsed.c || 'text',
+      retentionMode: parsed.r === 'temporary' ? 'temporary' : 'saved',
+      title: parsed.t || 'Beamed via QR Link',
+      content: parsed.v,
+      fileName: parsed.f,
+      mimeType: parsed.m,
+      senderDevice: parsed.d === 'desktop' ? 'desktop' : 'mobile',
+      senderName: parsed.s || 'QR Instant Beam',
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Builds the canonical GitHub Pages deployment URL for a given GitHub username and repository name.
+ */
+export function buildGithubPagesUrl(
+  username: string,
+  repoName = 'qrLinkShare',
+  roomCode?: string
+): string {
+  const cleanUser = username
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '');
+  const cleanRepo =
+    repoName.trim().replace(/[^a-zA-Z0-9._-]/g, '') || 'qrLinkShare';
+  const baseUrl = cleanUser
+    ? `https://${cleanUser}.github.io/${cleanRepo}/`
+    : `https://your-username.github.io/${cleanRepo}/`;
+  if (!roomCode) return baseUrl;
+  const normalizedRoom = normalizeRoomCode(roomCode) || 'SYNC-42';
+  return `${baseUrl}?room=${encodeURIComponent(normalizedRoom)}`;
+}
+
+/**
+ * Computes summary counts and total byte size for a room, including temporary vs saved counts.
  */
 export function computeRoomStats(items: SharedItem[]): {
   totalItems: number;
   totalBytes: number;
   pinnedCount: number;
+  temporaryCount: number;
+  savedCount: number;
+  unopenedLinkCount: number;
   countByCategory: Record<ShareCategory, number>;
 } {
   const countByCategory: Record<ShareCategory, number> = {
@@ -306,17 +484,31 @@ export function computeRoomStats(items: SharedItem[]): {
   };
   let totalBytes = 0;
   let pinnedCount = 0;
+  let temporaryCount = 0;
+  let savedCount = 0;
+  let unopenedLinkCount = 0;
 
   for (const item of items) {
     countByCategory[item.category] = (countByCategory[item.category] ?? 0) + 1;
     totalBytes += item.sizeBytes || 0;
     if (item.pinned) pinnedCount += 1;
+    if (item.retentionMode === 'temporary') {
+      temporaryCount += 1;
+    } else {
+      savedCount += 1;
+    }
+    if (item.category === 'link' && !item.openedOnDesktop) {
+      unopenedLinkCount += 1;
+    }
   }
 
   return {
     totalItems: items.length,
     totalBytes,
     pinnedCount,
+    temporaryCount,
+    savedCount,
+    unopenedLinkCount,
     countByCategory,
   };
 }

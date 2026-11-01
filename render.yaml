@@ -5,7 +5,7 @@ services:
     runtime: node
     region: singapore # closest Render region to India
     plan: free # 512 MB RAM. Keep the storage caps below well under that.
-    buildCommand: npm install && npm run build
+    buildCommand: npm ci && npm run build
     startCommand: node --import tsx server.ts --prod
     healthCheckPath: /api/health
     envVars:
@@ -13,6 +13,9 @@ services:
         value: "22"
       - key: SERVER_SECRET
         generateValue: true
+      # The page on GitHub Pages may call this server, and wallet sign-in works there.
+      - key: ALLOWED_ORIGINS
+        value: "*,https://digitalmarket-arch.github.io"
       # Shared files live in RAM. On the free plan keep the total around 150 MB.
       - key: MAX_STORE_MB
         value: "150"

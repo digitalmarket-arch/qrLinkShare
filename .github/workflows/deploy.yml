@@ -1,10 +1,13 @@
 name: Deploy qrLinkShare to GitHub Pages
 
+# The page on GitHub Pages talks to the live server (deployed separately, e.g. on
+# Render with render.yaml). Set the repository variable VITE_SERVER_URL to that
+# server's address: Settings → Secrets and variables → Actions → Variables.
+
 on:
   push:
     branches:
       - main
-      - master
   workflow_dispatch:
 
 permissions:
@@ -17,26 +20,47 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - id: check
+        env:
+          SERVER_URL: ${{ vars.VITE_SERVER_URL }}
+        run: |
+          if [ -z "$SERVER_URL" ]; then
+            echo "::warning title=Not deployed yet::Set the repository variable VITE_SERVER_URL to your server address (e.g. https://qrlinkshare.onrender.com), then run this workflow again from the Actions tab."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Deploying with server $SERVER_URL"
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
-    # The page is useless without a server, so only publish once VITE_SERVER_URL is set.
-    if: ${{ vars.VITE_SERVER_URL != '' }}
+    needs: check
+    if: needs.check.outputs.ready == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 22
+          cache: npm
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
-      - name: Build static production bundle
+      - name: Type-check and test
+        run: |
+          npm run lint
+          npm test
+
+      - name: Build the page
         env:
-          # Set this repo variable (Settings → Secrets and variables → Actions → Variables)
-          # to your deployed server, e.g. https://qrlinkshare.onrender.com
           VITE_SERVER_URL: ${{ vars.VITE_SERVER_URL }}
         run: |
           npm run build
@@ -49,11 +73,11 @@ jobs:
           path: ./dist
 
   deploy:
+    needs: build
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
-    needs: build
     steps:
       - name: Deploy to GitHub Pages
         id: deployment

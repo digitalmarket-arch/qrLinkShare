@@ -52,30 +52,45 @@ BASE=http://localhost:3000 npm run check:api   # API & security checks against a
 
 ## Deploy (put it on the internet)
 
-Real-time sharing needs the Node server running somewhere. **GitHub Pages alone is not enough**, because it can only host static pages and cannot pass files between devices.
+The site has two parts:
 
-**Easiest: Render (free tier).** This repo has a `render.yaml`:
+- **The page** (what people see) lives on **GitHub Pages**: `https://digitalmarket-arch.github.io/qrLinkShare/`
+- **The live server** (what passes files between devices in real time) lives on **Render**, free plan. GitHub Pages can only host static pages, so it can't do this part.
 
-1. Go to [render.com](https://render.com) → **New → Blueprint** → pick this repository.
-2. It builds and starts automatically, in the Singapore region (closest to India), with a random `SERVER_SECRET`.
-3. Open the `.onrender.com` URL. Done.
+### One-time setup (about 15 minutes)
 
-Caveats of the free plan:
-- It sleeps after 15 minutes without visitors, so the first visit takes about 30 seconds. Because files are kept in memory, a sleep or restart also clears shared items.
-- It has 512 MB of RAM, so `render.yaml` caps stored items at 150 MB in total (`MAX_STORE_MB`) and 60 MB per person (`MAX_USER_MB`). When the server is full, new uploads are politely refused until old items expire. Keep `MAX_STORE_MB` well below the RAM size.
+**Step 1: Start the server on Render**
+1. Go to [render.com](https://render.com) and sign up with your GitHub account.
+2. Click **New → Blueprint**, pick **digitalmarket-arch/qrLinkShare**, then **Apply**. `render.yaml` already has every setting (Singapore region, closest to India; a random secret; permission for the GitHub Pages address).
+3. Wait 3-5 minutes until it says **Live**. Copy its address, e.g. `https://qrlinkshare.onrender.com`. (If that name is taken, Render adds a few letters. Use whatever it shows.)
 
-A paid plan (about $7/month) removes both limits. If you upgrade, you can raise `MAX_STORE_MB`. Any Node host that supports WebSockets works the same way (Railway, Fly.io, a VPS). On those hosts, also set `PUBLIC_ORIGIN` to your site's address, otherwise wallet sign-in is switched off for safety.
+**Step 2: Turn on GitHub Pages**
+1. In the GitHub repo: **Settings → Pages → Build and deployment → Source: GitHub Actions**.
 
-**Optional: frontend on GitHub Pages + server on Render.**
-1. In GitHub, set the repository variable `VITE_SERVER_URL` (Settings → Secrets and variables → Actions → Variables) to your server URL, e.g. `https://qrlinkshare.onrender.com`. The included workflow then publishes the page on every push to `main`. It does nothing until this variable is set.
-2. On the server (Render → Environment), set `ALLOWED_ORIGINS` to your Pages address, e.g. `https://yourname.github.io`. Wallet sign-in only works on websites listed there.
+**Step 3: Tell the page where the server is**
+1. **Settings → Secrets and variables → Actions → Variables tab → New repository variable**
+2. Name: `VITE_SERVER_URL`. Value: the Render address from step 1, with no `/` at the end.
+
+**Step 4: Publish**
+1. **Actions tab → "Deploy qrLinkShare to GitHub Pages" → Run workflow** (branch `main`).
+2. About 2 minutes later the site is live at `https://digitalmarket-arch.github.io/qrLinkShare/`.
+3. After that, every change merged into `main` republishes automatically.
+
+**Step 5: Allow Google sign-in on the new address.** See "Google sign-in setup" below. Add `digitalmarket-arch.github.io`.
+
+### Free plan caveats
+- The server sleeps after 15 minutes without visitors. The next visitor sees "Waking up the server…" for up to a minute. Because files are kept in memory, a sleep or restart also clears shared items.
+- It has 512 MB of RAM, so `render.yaml` caps stored items at 150 MB in total (`MAX_STORE_MB`) and 60 MB per person (`MAX_USER_MB`). When the server is full, new uploads are politely refused until old items expire.
+- A paid Render plan (about $7/month) removes both limits. You can then raise `MAX_STORE_MB`.
+
+The Render address also works on its own as a complete copy of the site. Any Node host that supports WebSockets works the same way (Railway, Fly.io, a VPS). On those hosts, also set `PUBLIC_ORIGIN` to your site's address, otherwise wallet sign-in is switched off for safety. If you use a different GitHub Pages address (another account or a custom domain), add it to `ALLOWED_ORIGINS` on the server, e.g. `*,https://yourname.github.io`.
 
 ### Google sign-in setup
 
 Google login uses Firebase Authentication (project settings in `firebase-applet-config.json`). In the [Firebase console](https://console.firebase.google.com):
 
 1. **Authentication → Sign-in method** → enable **Google**.
-2. **Authentication → Settings → Authorized domains** → add your live domain (e.g. `qrlinkshare.onrender.com`).
+2. **Authentication → Settings → Authorized domains** → add `digitalmarket-arch.github.io` and your Render domain (e.g. `qrlinkshare.onrender.com`).
 
 To use your own Firebase project, replace the values in `firebase-applet-config.json`. The Firebase web config is meant to be public. The server checks every Google token itself.
 

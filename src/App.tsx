@@ -312,14 +312,7 @@ function Shell() {
   /* --------------------------------- render --------------------------------- */
 
   if (boot === 'unreachable') return <Unreachable onRetry={runBoot} />;
-  if (boot === 'loading' || !session) {
-    return (
-      <div className="min-h-dvh flex flex-col items-center justify-center gap-4">
-        <Logo />
-        <Loader2 className="w-5 h-5 animate-spin text-muted" aria-label="Loading" />
-      </div>
-    );
-  }
+  if (boot === 'loading' || !session) return <BootScreen />;
 
   const isAccount = session.method === 'google' || session.method === 'wallet';
   const deviceList = (
@@ -410,6 +403,26 @@ function Shell() {
         onClose={() => setWalletOpen(false)}
         onPick={pickWallet}
       />
+    </div>
+  );
+}
+
+/** Loading screen. Free hosting puts the server to sleep when idle, so explain a slow start. */
+function BootScreen() {
+  const [slow, setSlow] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setSlow(true), 4000);
+    return () => clearTimeout(t);
+  }, []);
+  return (
+    <div className="min-h-dvh flex flex-col items-center justify-center gap-4 p-6 text-center">
+      <Logo />
+      <Loader2 className="w-5 h-5 animate-spin text-muted" aria-label="Loading" />
+      {slow && (
+        <p className="animate-rise text-sm text-muted max-w-xs" aria-live="polite">
+          Waking up the server… This can take up to a minute after a quiet period. Thanks for waiting.
+        </p>
+      )}
     </div>
   );
 }

@@ -1,0 +1,102 @@
+/**
+ * Google (Firebase) and Web3 wallet sign-in verification.
+ */
+import { createRemoteJWKSet, jwtVerify } from 'jose';
+import { createPublicClient, http, getAddress, verifyMessage, type Chain } from 'viem';
+import { arbitrum, base, mainnet, optimism, polygon } from 'viem/chains';
+import firebaseConfig from '../firebase-applet-config.json' with { type: 'json' };
+import { buildWalletMessage, parseWalletMessage } from '../src/lib/shared';
+import { randomId } from './tokens';
+
+/* ---------------------------- Google / Firebase --------------------------- */
+
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || firebaseConfig.projectId;
+const firebaseJwks = createRemoteJWKSet(
+  new URL('https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com')
+);
+
+/** Checks a Firebase ID token (from signInWithPopup) and returns the user. */
+export async function verifyGoogleIdToken(idToken: string): Promise<{ uid: string; email?: string }> {
+  const { payload } = await jwtVerify(idToken, firebaseJwks, {
+    issuer: `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`,
+    audience: FIREBASE_PROJECT_ID,
+  });
+  if (!payload.sub) throw new Error('Token has no user id.');
+  const email = typeof payload.email === 'string' ? payload.email : undefined;
+  return { uid: payload.sub, email };
+}
+
+/* ------------------------------ Web3 wallets ------------------------------ */
+
+const NONCE_TTL_MS = 5 * 60 * 1000;
+/** nonce -> the exact message we issued. Signatures are only accepted for that exact text. */
+const walletNonces = new Map<string, { message: string; expiresAt: number }>();
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [nonce, rec] of walletNonces) if (rec.expiresAt < now) walletNonces.delete(nonce);
+}, 60_000).unref();
+
+/**
+ * Creates the sign-in message the wallet will be asked to sign.
+ * `siteOrigin` must be one of THIS site's own origins (chosen by the server, never
+ * copied blindly from the request), so a phishing site can't obtain a message that
+ * names itself; the wallet would warn that the domain doesn't match.
+ */
+export function createWalletChallenge(params: { address: string; chainId: number; siteOrigin: string }): string {
+  const address = getAddress(params.address); // throws on invalid, returns EIP-55 checksum form
+  const originUrl = new URL(params.siteOrigin);
+  const nonce = randomId(12).replace(/[^a-zA-Z0-9]/g, '');
+  const now = Date.now();
+  const message = buildWalletMessage({
+    domain: originUrl.host,
+    uri: originUrl.origin,
+    address,
+    chainId: Number.isInteger(params.chainId) && params.chainId > 0 ? params.chainId : 1,
+    nonce,
+    issuedAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + NONCE_TTL_MS).toISOString(),
+  });
+  walletNonces.set(nonce, { message, expiresAt: now + NONCE_TTL_MS });
+  return message;
+}
+
+const CHAINS: Record<number, Chain> = {
+  1: mainnet,
+  8453: base,
+  137: polygon,
+  10: optimism,
+  42161: arbitrum,
+};
+
+/** Verifies a signed wallet message. Returns the checksummed address. */
+export async function verifyWalletSignature(params: { message: string; signature: string }): Promise<string> {
+  const parsed = parseWalletMessage(params.message);
+  if (!parsed) throw new Error('Malformed sign-in message.');
+
+  const issued = walletNonces.get(parsed.nonce);
+  if (!issued || issued.expiresAt < Date.now()) throw new Error('Sign-in request expired. Please try again.');
+  // One-time use, even if verification fails below.
+  walletNonces.delete(parsed.nonce);
+  if (issued.message !== params.message) throw new Error('Signed message does not match the sign-in request.');
+
+  const address = getAddress(parsed.address);
+  const signature = params.signature as `0x${string}`;
+  if (!/^0x[0-9a-fA-F]+$/.test(signature)) throw new Error('Invalid signature.');
+
+  // 1) Normal wallets (MetaMask, Trust, Rabby…): pure math, no network needed.
+  const okEoa = await verifyMessage({ address, message: params.message, signature }).catch(() => false);
+  if (okEoa) return address;
+
+  // 2) Smart-contract wallets (e.g. Coinbase Smart Wallet) need an on-chain check (EIP-1271/6492).
+  const chainIdLine = params.message.match(/^Chain ID: (\d+)$/m);
+  const chain = CHAINS[Number(chainIdLine?.[1] ?? 1)] ?? mainnet;
+  try {
+    const client = createPublicClient({ chain, transport: http() });
+    const okContract = await client.verifyMessage({ address, message: params.message, signature });
+    if (okContract) return address;
+  } catch {
+    // fall through
+  }
+  throw new Error('Signature check failed.');
+}

@@ -1,496 +1,559 @@
-import express from 'express';
-import http from 'http';
-import path from 'path';
-import { fileURLToPath } from 'url';
+/**
+ * qrLinkShare server
+ *  - REST API for pairing (QR / PIN), sign-in (Google / wallet) and sharing items
+ *  - WebSocket hub at /ws that pushes new items to every device in a room instantly
+ *  - Serves the React app (Vite in dev, ./dist in production)
+ */
+import express, { type NextFunction, type Request, type Response } from 'express';
+import http from 'node:http';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { WebSocket, WebSocketServer } from 'ws';
-import { createServer as createViteServer } from 'vite';
+import type { AuthMethod, DeviceInfo, DeviceType, PresentDevice, RoomSession } from './src/types/share';
 import {
-  ConnectedDevice,
-  CreateShareItemPayload,
-  DeviceType,
-  QrLoginChallenge,
-  RetentionMode,
-  SharedItem,
-} from './src/types/share';
-import {
-  normalizeRoomCode,
-  validatePinCode,
-  validateShareSubmission,
-} from './src/utils/shareLogic';
-import { createInitialSeedItems } from './src/utils/seedData';
+  MAX_FILE_BYTES,
+  MAX_TEXT_CHARS,
+  cleanPin,
+  fileKindOf,
+  isInlineSafeMime,
+  safeFileName,
+  shortAddress,
+  toHttpUrl,
+} from './src/lib/shared';
+import { accountRoomId, issueToken, randomId, verifyToken, type AccessClaims } from './server/tokens';
+import { createWalletChallenge, verifyGoogleIdToken, verifyWalletSignature } from './server/auth';
+import { itemCost, store } from './server/store';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-interface RoomRecord {
-  roomId: string;
-  items: SharedItem[];
-  devices: Map<string, ConnectedDevice>;
-}
-
-const rooms = new Map<string, RoomRecord>();
-const loginChallenges = new Map<string, QrLoginChallenge>();
-
-function getOrCreateRoom(rawRoomId: string): RoomRecord {
-  const roomId = normalizeRoomCode(rawRoomId) || 'SYNC-42';
-  let room = rooms.get(roomId);
-  if (!room) {
-    room = {
-      roomId,
-      items: roomId === 'SYNC-42' ? createInitialSeedItems('SYNC-42') : [],
-      devices: new Map<string, ConnectedDevice>(),
-    };
-    rooms.set(roomId, room);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PORT = Number(process.env.PORT || 3000);
+const IS_PROD = process.env.NODE_ENV === 'production' || process.argv.includes('--prod');
+const list = (v: string | undefined) => (v || '').split(',').map((s) => s.trim()).filter(Boolean);
+/**
+ * "https://Share.Example.com/" -> "https://share.example.com", so copy-pasted values still match.
+ * Other schemes (e.g. capacitor://localhost) are kept as written, minus a trailing slash.
+ */
+const normOrigin = (o: string): string | null => {
+  try {
+    const u = new URL(o);
+    if (u.protocol === 'http:' || u.protocol === 'https:') return u.origin;
+    const kept = o.trim().replace(/\/+$/, '');
+    return kept.toLowerCase() === 'null' ? null : kept;
+  } catch {
+    console.warn(`[config] Ignoring invalid origin "${o}"`);
+    return null;
   }
-  return room;
+};
+const origins = (values: string[]) => values.map(normOrigin).filter((o): o is string => !!o);
+const isWebOrigin = (o: string) => /^https?:\/\//.test(o);
+const rawAllowed = list(process.env.ALLOWED_ORIGINS || '*');
+/** '*' (any site may call the API) can be combined with explicit sites, which wallet sign-in needs. */
+const ALLOWED_ORIGINS = [...(rawAllowed.includes('*') ? ['*'] : []), ...origins(rawAllowed.filter((o) => o !== '*'))];
+/** This site's own public address(es), e.g. https://share.example.com. Required for wallet sign-in on most hosts. */
+const PUBLIC_ORIGINS = origins(list(process.env.PUBLIC_ORIGIN)).filter(isWebOrigin);
+/** Render sets this automatically (and only routes requests for this service's own domains to it). */
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL ? normOrigin(process.env.RENDER_EXTERNAL_URL) : null;
+const UPLOAD_BYTES_PER_HOUR = Number(process.env.UPLOAD_MB_PER_HOUR || 300) * 1024 * 1024;
+// Uploaded files never live outside RAM, so a plain-text note must declare UTF-8 to display correctly.
+const withCharset = (mime: string) => (/^text\/plain$/i.test(mime) ? 'text/plain; charset=utf-8' : mime);
+
+/* -------------------------------- helpers -------------------------------- */
+
+interface AuthedRequest extends Request {
+  claims?: AccessClaims;
 }
 
-// Pre-seed default room SYNC-42
-getOrCreateRoom('SYNC-42');
-
-interface ClientMeta {
-  ws: WebSocket;
-  clientId: string;
-  roomId: string;
-  deviceName: string;
-  deviceType: DeviceType;
+function bearer(req: Request): string | undefined {
+  const h = req.headers.authorization || '';
+  return h.startsWith('Bearer ') ? h.slice(7) : undefined;
 }
 
-const clients = new Map<WebSocket, ClientMeta>();
+function requireRoom(req: AuthedRequest, res: Response, next: NextFunction) {
+  const claims = verifyToken(bearer(req));
+  if (!claims) return void res.status(401).json({ error: 'Your session expired. Please pair again.' });
+  if (req.params.roomId && req.params.roomId !== claims.r) {
+    return void res.status(403).json({ error: 'You do not have access to this room.' });
+  }
+  req.claims = claims;
+  next();
+}
 
-function broadcastToRoom(roomId: string, event: Record<string, unknown>) {
-  const payload = JSON.stringify(event);
-  for (const [, meta] of clients) {
-    if (meta.roomId === roomId && meta.ws.readyState === WebSocket.OPEN) {
-      meta.ws.send(payload);
+function readDevice(req: Request): DeviceInfo {
+  const decode = (v: unknown, max: number) => {
+    try {
+      return decodeURIComponent(String(v || '')).slice(0, max);
+    } catch {
+      return '';
     }
+  };
+  const type = String(req.headers['x-device-type'] || '');
+  return {
+    id: decode(req.headers['x-device-id'], 64) || 'unknown',
+    name: decode(req.headers['x-device-name'], 60) || 'Unknown device',
+    type: (['desktop', 'mobile', 'tablet'].includes(type) ? type : 'desktop') as DeviceType,
+  };
+}
+
+const isLocalHost = (host: string) =>
+  /^(localhost|127\.\d+\.\d+\.\d+|\[::1\]|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|[\w-]+\.local)(:\d+)?$/i.test(host);
+
+/**
+ * The website a wallet sign-in message should name. Only this site's own addresses
+ * qualify, so another website can never get a message that names itself:
+ *  - PUBLIC_ORIGIN (+ explicit ALLOWED_ORIGINS, e.g. a GitHub Pages frontend) when set;
+ *  - otherwise the address the browser used, but only where the Host header can be
+ *    trusted: on Render (which routes by domain) or on localhost / your home network.
+ * Returns null for anything else.
+ */
+const warnedOrigins = new Set<string>();
+function refuseOrigin(origin: string, hint: string): null {
+  if (warnedOrigins.size < 50 && !warnedOrigins.has(origin)) {
+    warnedOrigins.add(origin);
+    console.warn(`[wallet] Refused sign-in from ${origin}. ${hint}`);
   }
+  return null;
+}
+function siteOriginFor(req: Request): string | null {
+  const raw = req.headers.origin;
+  const origin = raw && raw !== 'null' ? raw : null;
+  const explicit = [...PUBLIC_ORIGINS, ...ALLOWED_ORIGINS.filter(isWebOrigin), ...(RENDER_URL ? [RENDER_URL] : [])];
+  if (!origin) return explicit[0] ?? null;
+  if (explicit.includes(origin)) return origin;
+  if (PUBLIC_ORIGINS.length) {
+    // The operator listed the site's addresses; nothing else counts.
+    return refuseOrigin(origin, `PUBLIC_ORIGIN lists ${PUBLIC_ORIGINS.join(', ')}. Add this address if it is yours.`);
+  }
+  let originHost = '';
+  try {
+    originHost = new URL(origin).host;
+  } catch {
+    return null;
+  }
+  const host = String(req.headers.host || '');
+  if (originHost !== host) {
+    return refuseOrigin(origin, 'If this is your own frontend (e.g. GitHub Pages), add it to ALLOWED_ORIGINS or PUBLIC_ORIGIN.');
+  }
+  if (RENDER_URL || isLocalHost(host)) return origin;
+  return refuseOrigin(origin, `Set PUBLIC_ORIGIN=${origin} to enable wallet sign-in on this host.`);
 }
 
-function serializeDevices(room: RoomRecord): ConnectedDevice[] {
-  return Array.from(room.devices.values());
+/**
+ * When a device that started its own room (and was alone there) joins another room,
+ * bring along what it already shared, so a note sent before pairing isn't lost.
+ * Only the room's creator (a 'guest' token) qualifies, and only if every item in it
+ * came from this device, so nobody can pull another device's items out of a room.
+ */
+function carryOver(fromToken: unknown, toRoomId: string, deviceId: string) {
+  const from = typeof fromToken === 'string' ? verifyToken(fromToken) : null;
+  if (!from || from.m !== 'guest' || from.r === toRoomId || !from.r.startsWith('r_')) return;
+  const room = store.rooms.get(from.r);
+  if (room?.items.some((i) => i.from.id !== deviceId)) return;
+  if (store.presence(from.r).some((d) => d.id !== deviceId)) return;
+  store.moveItems(from.r, toRoomId, deviceId);
 }
 
-async function startServer() {
+/** Per-IP upload budget, so one client can't fill the whole server's memory. */
+const uploadUse = new Map<string, { bytes: number; resetAt: number }>();
+function uploadBudgetLeft(ip: string): number {
+  const rec = uploadUse.get(ip);
+  if (!rec || rec.resetAt < Date.now()) return UPLOAD_BYTES_PER_HOUR;
+  return UPLOAD_BYTES_PER_HOUR - rec.bytes;
+}
+function chargeUpload(ip: string, bytes: number) {
+  const now = Date.now();
+  const rec = uploadUse.get(ip);
+  if (!rec || rec.resetAt < now) uploadUse.set(ip, { bytes, resetAt: now + 60 * 60_000 });
+  else rec.bytes += bytes;
+}
+
+function session(roomId: string, method: AuthMethod, account?: string): RoomSession {
+  return { roomId, token: issueToken(roomId, method, account), method, account };
+}
+
+/** Tiny fixed-window rate limiter (per IP + bucket). */
+const hits = new Map<string, { count: number; resetAt: number }>();
+function rateLimit(bucket: string, max: number, windowMs: number) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const key = `${bucket}:${req.ip}`;
+    const now = Date.now();
+    const rec = hits.get(key);
+    if (!rec || rec.resetAt < now) {
+      hits.set(key, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+    if (++rec.count > max) {
+      res.setHeader('Retry-After', Math.ceil((rec.resetAt - now) / 1000));
+      return void res.status(429).json({ error: 'Too many attempts. Please wait a minute and try again.' });
+    }
+    next();
+  };
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of hits) if (v.resetAt < now) hits.delete(k);
+  for (const [k, v] of uploadUse) if (v.resetAt < now) uploadUse.delete(k);
+}, 60_000).unref();
+
+/* --------------------------------- app ---------------------------------- */
+
+async function main() {
   const app = express();
-  const server = http.createServer(app);
+  // Production mode for Express too (hides stack traces in error pages).
+  app.set('env', IS_PROD ? 'production' : 'development');
+  app.set('trust proxy', 1);
+  app.disable('x-powered-by');
 
-  app.use(express.json({ limit: '25mb' }));
+  // CORS, so the frontend can be hosted elsewhere (e.g. GitHub Pages) and call this API.
+  app.use('/api', (req, res, next) => {
+    const origin = req.headers.origin;
+    // Always vary on Origin, so a cached no-CORS response (e.g. an <img>) is never reused for fetch().
+    res.setHeader('Vary', 'Origin');
+    if (origin && (ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin))) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
+      res.setHeader(
+        'Access-Control-Allow-Headers',
+        'Authorization,Content-Type,X-File-Name,X-Device-Id,X-Device-Name,X-Device-Type'
+      );
+      res.setHeader('Access-Control-Max-Age', '600');
+    }
+    if (req.method === 'OPTIONS') return void res.sendStatus(204);
+    next();
+  });
+
+  const json = express.json({ limit: '100kb' });
 
   app.get('/api/health', (_req, res) => {
-    res.json({ status: 'ok', activeRooms: rooms.size });
+    res.json({ ok: true, rooms: store.rooms.size, files: store.files.size });
   });
 
-  // Register or refresh a QR Login / 6-Digit PIN challenge for desktop authentication
-  app.post('/api/auth/challenges', (req, res) => {
-    const challengeId =
-      String(req.body?.challengeId || '').trim() ||
-      `qr-auth-${Date.now()}`;
-    const pinCode = String(req.body?.pinCode || '482910').trim();
-    const roomId = normalizeRoomCode(String(req.body?.roomId || 'SYNC-42')) || 'SYNC-42';
+  /* ----------------------------- sessions ----------------------------- */
 
-    const record: QrLoginChallenge = {
-      challengeId,
-      pinCode,
-      roomId,
-      status: 'pending',
-      createdAt: new Date().toISOString(),
-    };
-    loginChallenges.set(challengeId, record);
-    res.status(201).json({ challenge: record });
+  // A brand-new private room for this device.
+  app.post('/api/rooms', rateLimit('rooms', 30, 60_000), (_req, res) => {
+    res.status(201).json(session(store.newRoomId(), 'guest'));
   });
 
-  // Approve a desktop QR Login challenge from phone
-  app.post('/api/auth/challenges/:challengeId/approve', (req, res) => {
-    const challengeId = req.params.challengeId;
-    const roomId =
-      normalizeRoomCode(String(req.body?.roomId || 'SYNC-42')) || 'SYNC-42';
-    const approvedByName =
-      String(req.body?.approvedByName || 'iPhone 16 Pro · QR Scan').trim();
-
-    const existing = loginChallenges.get(challengeId) || {
-      challengeId,
-      pinCode: String(req.body?.pinCode || '482910'),
-      roomId,
-      status: 'approved' as const,
-      createdAt: new Date().toISOString(),
-    };
-
-    existing.status = 'approved';
-    existing.roomId = roomId;
-    existing.approvedByName = approvedByName;
-    loginChallenges.set(challengeId, existing);
-
-    broadcastToRoom(roomId, {
-      type: 'auth:approved',
-      challenge: existing,
-    });
-
-    res.json({ challenge: existing });
+  // Check that a saved session is still valid.
+  app.get('/api/session', (req, res) => {
+    const claims = verifyToken(bearer(req));
+    if (!claims) return void res.status(401).json({ error: 'Session expired.' });
+    res.json({ roomId: claims.r, method: claims.m, account: claims.a });
   });
 
-  // Verify a 6-digit pairing PIN code on desktop
-  app.post('/api/auth/pin-verify', (req, res) => {
-    const rawPin = String(req.body?.pinCode || '');
-    const roomId =
-      normalizeRoomCode(String(req.body?.roomId || 'SYNC-42')) || 'SYNC-42';
-    const validation = validatePinCode(rawPin);
-    if (!validation.valid) {
-      res.status(400).json({ error: validation.error });
-      return;
-    }
+  /* ------------------------------ pairing ----------------------------- */
 
-    // Find matching challenge or accept valid 6-digit pairing PIN for the active room
-    let matchedRoom = roomId;
-    for (const [, ch] of loginChallenges) {
-      if (ch.pinCode === validation.cleaned) {
-        ch.status = 'approved';
-        matchedRoom = ch.roomId;
-        break;
-      }
-    }
-
-    const room = getOrCreateRoom(matchedRoom);
-    broadcastToRoom(room.roomId, {
-      type: 'auth:approved',
-      challenge: {
-        challengeId: `pin-${validation.cleaned}`,
-        pinCode: validation.cleaned,
-        roomId: room.roomId,
-        status: 'approved',
-        approvedByName: `6-Digit PIN (${validation.cleaned})`,
-        createdAt: new Date().toISOString(),
-      },
-    });
-
-    res.json({
-      authenticated: true,
-      method: 'pin',
-      pinCode: validation.cleaned,
-      roomId: room.roomId,
-      items: room.items,
-    });
+  // Show this on screen: a QR token + a 6-digit PIN that let ONE other device join.
+  app.post('/api/rooms/:roomId/pair', rateLimit('pair-create', 60, 60_000), requireRoom, (req: AuthedRequest, res) => {
+    res.json(store.createPairing(req.claims!.r));
   });
 
-  // Get room state
-  app.get('/api/rooms/:roomId', (req, res) => {
-    const room = getOrCreateRoom(req.params.roomId);
-    res.json({
-      roomId: room.roomId,
-      items: room.items,
-      devices: serializeDevices(room),
-    });
-  });
+  // The other device redeems the PIN (typed) or the token (scanned QR).
+  app.post('/api/pair/claim', json, rateLimit('pair-claim', 12, 5 * 60_000), (req, res) => {
+    const pin = req.body?.pin ? cleanPin(String(req.body.pin)) : null;
+    const pairToken = typeof req.body?.pairToken === 'string' ? req.body.pairToken.slice(0, 64) : undefined;
+    if (!pin && !pairToken) return void res.status(400).json({ error: 'Enter the 6-digit PIN shown on the other device.' });
 
-  // Create/drop a shared item in the room
-  app.post('/api/rooms/:roomId/items', (req, res) => {
-    const room = getOrCreateRoom(req.params.roomId);
-    const body = req.body as CreateShareItemPayload;
-
-    const validation = validateShareSubmission(body);
-    if (!validation.valid || !validation.resolvedCategory) {
-      res.status(400).json({ error: validation.error || 'Invalid share item.' });
-      return;
-    }
-
-    const itemId =
-      body.id || `item-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-
-    const existing = room.items.find((i) => i.id === itemId);
-    if (existing) {
-      res.status(200).json({ item: existing });
-      return;
-    }
-
-    const resolvedContent =
-      validation.resolvedCategory === 'link' && validation.normalizedUrl
-        ? validation.normalizedUrl
-        : (body.content ?? '').trim();
-
-    const defaultTitle =
-      body.title?.trim() ||
-      body.fileName?.trim() ||
-      (validation.resolvedCategory === 'link'
-        ? resolvedContent.replace(/^https?:\/\//, '').slice(0, 48)
-        : resolvedContent.slice(0, 42) || 'Shared Item');
-
-    const sizeBytes =
-      typeof body.sizeBytes === 'number' && body.sizeBytes > 0
-        ? body.sizeBytes
-        : body.dataUrl
-          ? Math.round((body.dataUrl.length * 3) / 4)
-          : Buffer.byteLength(resolvedContent, 'utf-8');
-
-    const retentionMode: RetentionMode =
-      body.retentionMode === 'temporary' ? 'temporary' : 'saved';
-
-    const newItem: SharedItem = {
-      id: itemId,
-      roomId: room.roomId,
-      category: validation.resolvedCategory,
-      retentionMode,
-      title: defaultTitle,
-      content: resolvedContent,
-      fileName: body.fileName,
-      mimeType: body.mimeType,
-      sizeBytes,
-      dataUrl: body.dataUrl,
-      senderDevice: body.senderDevice === 'mobile' ? 'mobile' : 'desktop',
-      senderName:
-        body.senderName?.trim() ||
-        (body.senderDevice === 'mobile' ? 'Mobile Handset' : 'Desktop Studio'),
-      createdAt: new Date().toISOString(),
-      pinned: false,
-      openedOnDesktop: false,
-    };
-
-    room.items.unshift(newItem);
-
-    broadcastToRoom(room.roomId, {
-      type: 'item:created',
-      item: newItem,
-    });
-
-    res.status(201).json({ item: newItem });
-  });
-
-  // Toggle pin on an item
-  app.patch('/api/rooms/:roomId/items/:itemId/pin', (req, res) => {
-    const room = getOrCreateRoom(req.params.roomId);
-    const target = room.items.find((i) => i.id === req.params.itemId);
-    if (!target) {
-      res.status(404).json({ error: 'Item not found.' });
-      return;
-    }
-    target.pinned = !target.pinned;
-    broadcastToRoom(room.roomId, {
-      type: 'item:updated',
-      item: target,
-    });
-    res.json({ item: target });
-  });
-
-  // Toggle or set retentionMode ('temporary' <-> 'saved')
-  app.patch('/api/rooms/:roomId/items/:itemId/retention', (req, res) => {
-    const room = getOrCreateRoom(req.params.roomId);
-    const target = room.items.find((i) => i.id === req.params.itemId);
-    if (!target) {
-      res.status(404).json({ error: 'Item not found.' });
-      return;
-    }
-    const requested = req.body?.retentionMode;
-    target.retentionMode =
-      requested === 'temporary' || requested === 'saved'
-        ? requested
-        : target.retentionMode === 'temporary'
-          ? 'saved'
-          : 'temporary';
-    broadcastToRoom(room.roomId, {
-      type: 'item:updated',
-      item: target,
-    });
-    res.json({ item: target });
-  });
-
-  // Mark item as opened on desktop (and optionally auto-delete if temporary one-time link)
-  app.patch('/api/rooms/:roomId/items/:itemId/opened', (req, res) => {
-    const room = getOrCreateRoom(req.params.roomId);
-    const target = room.items.find((i) => i.id === req.params.itemId);
-    if (!target) {
-      res.status(404).json({ error: 'Item not found.' });
-      return;
-    }
-    target.openedOnDesktop = true;
-    const autoDeleteTemp = Boolean(req.body?.autoDeleteTemp);
-    if (autoDeleteTemp && target.retentionMode === 'temporary') {
-      room.items = room.items.filter((i) => i.id !== target.id);
-      broadcastToRoom(room.roomId, {
-        type: 'item:deleted',
-        itemId: target.id,
+    const device = readDevice(req);
+    const roomId = store.claimPairing(pin ? { pin } : { pairToken }, device);
+    if (!roomId) {
+      return void res.status(404).json({
+        error: pin
+          ? 'That PIN is wrong or has expired. Check the other screen for the current PIN.'
+          : 'This QR code has expired. Ask the other device to show a fresh one.',
       });
-      res.json({ deleted: true, itemId: target.id });
-      return;
     }
-
-    broadcastToRoom(room.roomId, {
-      type: 'item:updated',
-      item: target,
-    });
-    res.json({ item: target });
+    carryOver(req.body?.fromToken, roomId, device.id);
+    res.json(session(roomId, pin ? 'pin' : 'qr'));
   });
 
-  // Delete a specific item (idempotent)
-  app.delete('/api/rooms/:roomId/items/:itemId', (req, res) => {
-    const room = getOrCreateRoom(req.params.roomId);
-    const itemId = req.params.itemId;
-    room.items = room.items.filter((i) => i.id !== itemId);
-    broadcastToRoom(room.roomId, {
-      type: 'item:deleted',
-      itemId,
-    });
-    res.json({ deleted: true, itemId });
+  /* ------------------------------ sign-in ----------------------------- */
+
+  app.post('/api/auth/google', json, rateLimit('auth', 30, 60_000), async (req, res) => {
+    try {
+      const user = await verifyGoogleIdToken(String(req.body?.idToken || ''));
+      const roomId = accountRoomId('google', user.uid);
+      carryOver(req.body?.fromToken, roomId, readDevice(req).id);
+      res.json(session(roomId, 'google', user.email || 'Google account'));
+    } catch (err) {
+      console.warn('[auth/google]', err instanceof Error ? err.message : err);
+      res.status(401).json({ error: 'Google sign-in could not be verified. Please try again.' });
+    }
   });
 
-  // Clear unpinned or temporary items in room
-  app.delete('/api/rooms/:roomId/items', (req, res) => {
-    const room = getOrCreateRoom(req.params.roomId);
-    const mode = req.query.mode;
-    if (mode === 'temporary') {
-      room.items = room.items.filter((i) => i.retentionMode !== 'temporary');
-    } else {
-      const keepPinned = req.query.keepPinned !== 'false';
-      room.items = keepPinned ? room.items.filter((i) => i.pinned) : [];
+  app.post('/api/auth/wallet/challenge', json, rateLimit('auth', 30, 60_000), (req, res) => {
+    const siteOrigin = siteOriginFor(req);
+    if (!siteOrigin) {
+      return void res.status(403).json({ error: 'Wallet sign-in is only available on the qrLinkShare website itself.' });
     }
-    broadcastToRoom(room.roomId, {
-      type: 'room:cleared',
-      items: room.items,
-    });
-    res.json({ items: room.items });
+    try {
+      const message = createWalletChallenge({
+        address: String(req.body?.address || ''),
+        chainId: Number(req.body?.chainId || 1),
+        siteOrigin,
+      });
+      res.json({ message });
+    } catch {
+      res.status(400).json({ error: 'That does not look like a valid wallet address.' });
+    }
   });
 
-  // Direct download endpoint for scanning an item's individual QR code on a phone or desktop
-  app.get('/api/rooms/:roomId/items/:itemId/download', (req, res) => {
-    const room = getOrCreateRoom(req.params.roomId);
-    const item = room.items.find((i) => i.id === req.params.itemId);
-    if (!item) {
-      res.status(404).send('Shared item not found.');
-      return;
+  app.post('/api/auth/wallet/verify', json, rateLimit('auth', 30, 60_000), async (req, res) => {
+    try {
+      const address = await verifyWalletSignature({
+        message: String(req.body?.message || ''),
+        signature: String(req.body?.signature || ''),
+      });
+      const roomId = accountRoomId('wallet', address);
+      carryOver(req.body?.fromToken, roomId, readDevice(req).id);
+      res.json(session(roomId, 'wallet', shortAddress(address)));
+    } catch (err) {
+      res.status(401).json({ error: err instanceof Error ? err.message : 'Wallet sign-in failed.' });
     }
+  });
 
-    if (item.category === 'link') {
-      res.redirect(item.content);
-      return;
+  /* ------------------------------- items ------------------------------ */
+
+  // Share a link or a text note.
+  app.post('/api/rooms/:roomId/items', json, rateLimit('items', 120, 60_000), requireRoom, (req: AuthedRequest, res) => {
+    const raw = typeof req.body?.text === 'string' ? req.body.text : '';
+    const text = raw.trim();
+    if (!text) return void res.status(400).json({ error: 'Type or paste something to send.' });
+    if (text.length > MAX_TEXT_CHARS) {
+      return void res.status(413).json({ error: `Text is too long (max ${MAX_TEXT_CHARS.toLocaleString()} characters).` });
     }
+    const url = toHttpUrl(text);
+    const content = url ? { url } : { text: raw.replace(/^\s*\n|\s+$/g, '') };
+    const owner = req.ip || '';
+    const refused = store.refuse(owner, itemCost(content), 'note');
+    if (refused) return void res.status(507).json({ error: refused });
+    const item = store.addItem(store.resolveRoom(req.claims!), owner, {
+      kind: url ? 'link' : 'text',
+      ...content,
+      from: readDevice(req),
+    });
+    res.status(201).json({ item });
+  });
 
-    if (item.dataUrl && item.dataUrl.startsWith('data:')) {
-      const match = item.dataUrl.match(/^data:([^;,]+)?(;base64)?,(.*)$/s);
-      if (match) {
-        const mime = match[1] || item.mimeType || 'application/octet-stream';
-        const isBase64 = Boolean(match[2]);
-        const rawData = match[3] || '';
-        const buffer = isBase64
-          ? Buffer.from(rawData, 'base64')
-          : Buffer.from(decodeURIComponent(rawData), 'utf-8');
-        const safeName = (item.fileName || `${item.id}.bin`).replace(
-          /[^a-zA-Z0-9._-]/g,
-          '_'
-        );
-        res.setHeader('Content-Type', mime);
-        res.setHeader('Content-Disposition', `inline; filename="${safeName}"`);
-        res.send(buffer);
-        return;
+  // Upload a file (raw bytes in the body, name in the X-File-Name header).
+  app.post(
+    '/api/rooms/:roomId/files',
+    rateLimit('files', 60, 60_000),
+    requireRoom,
+    (req, res, next) => {
+      const declared = Number(req.headers['content-length'] || 0);
+      if (declared > uploadBudgetLeft(req.ip || '')) {
+        return void res.status(429).json({ error: 'Upload limit reached for now. Please try again in an hour.' });
       }
+      const refused = store.refuse(req.ip || '', declared, 'file');
+      if (refused) return void res.status(507).json({ error: refused });
+      next();
+    },
+    express.raw({ type: () => true, limit: MAX_FILE_BYTES }),
+    (req: AuthedRequest, res) => {
+      const data = req.body as Buffer;
+      if (!Buffer.isBuffer(data) || data.length === 0) {
+        return void res.status(400).json({ error: 'The file is empty.' });
+      }
+      const owner = req.ip || '';
+      if (data.length > uploadBudgetLeft(owner)) {
+        return void res.status(429).json({ error: 'Upload limit reached for now. Please try again in an hour.' });
+      }
+      const refused = store.refuse(owner, data.length, 'file');
+      if (refused) return void res.status(507).json({ error: refused });
+      chargeUpload(owner, data.length);
+      let name = 'file';
+      try {
+        name = safeFileName(decodeURIComponent(String(req.headers['x-file-name'] || 'file')));
+      } catch {
+        // keep default
+      }
+      const mime = String(req.headers['content-type'] || 'application/octet-stream').split(';')[0].slice(0, 100);
+      const item = store.addItem(
+        store.resolveRoom(req.claims!),
+        owner,
+        {
+          kind: 'file',
+          file: { fileId: randomId(18), name, size: data.length, mime },
+          from: readDevice(req),
+        },
+        data
+      );
+      res.status(201).json({ item });
     }
+  );
 
-    const safeTxtName = (item.fileName || `${item.id}.txt`).replace(
-      /[^a-zA-Z0-9._-]/g,
-      '_'
-    );
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.setHeader('Content-Disposition', `inline; filename="${safeTxtName}"`);
-    res.send(item.content);
+  app.delete('/api/rooms/:roomId/items/:itemId', requireRoom, (req: AuthedRequest, res) => {
+    store.removeItem(req.claims!.r, String(req.params.itemId));
+    res.json({ ok: true });
   });
 
-  // Attach WebSocket server on /ws for real-time phone-to-desktop synchronization
-  const wss = new WebSocketServer({ server, path: '/ws' });
+  app.delete('/api/rooms/:roomId/items', requireRoom, (req: AuthedRequest, res) => {
+    store.clearRoom(req.claims!.r);
+    res.json({ ok: true });
+  });
+
+  // Download / preview. The long random fileId acts as the key, so this link also
+  // works from a per-item QR code on a phone that never paired.
+  app.get('/api/files/:fileId', (req, res) => {
+    const file = store.files.get(String(req.params.fileId));
+    if (!file || file.expiresAt < Date.now()) return void res.status(404).send('This file has expired or was deleted.');
+
+    const { mime, name } = file.meta;
+    const inline = req.query.download === undefined && isInlineSafeMime(mime);
+    const encoded = encodeURIComponent(name);
+    res.setHeader('Content-Type', withCharset(mime) || 'application/octet-stream');
+    res.setHeader(
+      'Content-Disposition',
+      `${inline ? 'inline' : 'attachment'}; filename="${name.replace(/[^\x20-\x7e]/g, '_')}"; filename*=UTF-8''${encoded}`
+    );
+    // Uploaded files must never run scripts on our domain.
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'");
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('Access-Control-Allow-Origin', '*'); // public capability URL, no cookies involved
+    res.send(file.data);
+  });
+
+  // Unknown API routes / errors (e.g. upload too large) should return JSON, not the SPA.
+  app.use('/api', (_req, res) => void res.status(404).json({ error: 'Not found.' }));
+  app.use((err: Error & { type?: string; status?: number }, _req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) return next(err);
+    if (err.type === 'entity.too.large') {
+      return void res.status(413).json({ error: `File is too large (max ${MAX_FILE_BYTES / 1024 / 1024} MB).` });
+    }
+    console.error(err);
+    res.status(err.status || 500).json({ error: 'Something went wrong on the server.' });
+  });
+
+  /* -------------------------------- web app ------------------------------- */
+
+  if (!IS_PROD) {
+    const { createServer } = await import('vite');
+    const vite = await createServer({ server: { middlewareMode: true }, appType: 'spa' });
+    app.use(vite.middlewares);
+  } else {
+    const dist = path.join(__dirname, 'dist');
+    app.use(express.static(dist, { index: false, maxAge: '1h' }));
+    app.get('*', (_req, res) => res.sendFile(path.join(dist, 'index.html')));
+  }
+  // Last resort for errors from the static/SPA routes (e.g. malformed %-encoding): no stack traces.
+  app.use((err: Error & { status?: number }, _req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) return next(err);
+    const status = err.status && err.status >= 400 && err.status < 600 ? err.status : 500;
+    res.status(status).type('text/plain').send(status < 500 ? 'Bad request' : 'Server error');
+  });
+
+  /* ------------------------------ WebSocket ------------------------------- */
+
+  const server = http.createServer(app);
+  const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 16 * 1024 });
+  // A port that can't be opened must stop the process with an error code (so the host restarts it).
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.syscall === 'listen') {
+      console.error(`[server] Cannot start on port ${PORT}:`, err.message);
+      process.exit(1);
+    }
+    console.error('[server] error', err);
+  });
+  wss.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.syscall !== 'listen') console.error('[ws] server error', err);
+  });
+
+  interface Conn {
+    ws: WebSocket;
+    id: string;
+    roomId?: string;
+    alive: boolean;
+  }
+  const conns = new Set<Conn>();
+
+  store.onEvent((roomId, event) => {
+    const payload = JSON.stringify(event);
+    for (const c of conns) {
+      if (c.roomId === roomId && c.ws.readyState === WebSocket.OPEN) c.ws.send(payload);
+    }
+  });
 
   wss.on('connection', (ws) => {
+    const conn: Conn = { ws, id: randomId(8), alive: true };
+    conns.add(conn);
+    ws.on('pong', () => (conn.alive = true));
+    // Oversized or corrupt frames surface here. Without a listener Node would crash the process.
+    ws.on('error', (err) => {
+      console.warn('[ws] socket error', err.message);
+      ws.terminate();
+    });
+
+    // The first message must be { type: 'hello', token, device }.
+    const helloTimer = setTimeout(() => !conn.roomId && ws.close(4001, 'hello timeout'), 10_000);
+
     ws.on('message', (raw) => {
       try {
-        const msg = JSON.parse(raw.toString());
-
-        if (msg.type === 'room:join') {
-          const room = getOrCreateRoom(msg.roomId || 'SYNC-42');
-          const clientId =
-            msg.clientId ||
-            `client-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-          const deviceType: DeviceType =
-            msg.deviceType === 'mobile' ? 'mobile' : 'desktop';
-          const deviceName =
-            msg.deviceName ||
-            (deviceType === 'mobile' ? 'Mobile Handset' : 'Desktop Studio');
-
-          const prev = clients.get(ws);
-          if (prev && prev.roomId !== room.roomId) {
-            const oldRoom = rooms.get(prev.roomId);
-            if (oldRoom) {
-              oldRoom.devices.delete(prev.clientId);
-              broadcastToRoom(oldRoom.roomId, {
-                type: 'presence:updated',
-                devices: serializeDevices(oldRoom),
-              });
-            }
-          }
-
-          const deviceRecord: ConnectedDevice = {
-            clientId,
-            deviceName,
-            deviceType,
-            joinedAt: new Date().toISOString(),
-          };
-
-          clients.set(ws, {
-            ws,
-            clientId,
-            roomId: room.roomId,
-            deviceName,
-            deviceType,
-          });
-          room.devices.set(clientId, deviceRecord);
-
-          ws.send(
-            JSON.stringify({
-              type: 'room:init',
-              roomId: room.roomId,
-              items: room.items,
-              devices: serializeDevices(room),
-            })
-          );
-
-          broadcastToRoom(room.roomId, {
-            type: 'presence:updated',
-            devices: serializeDevices(room),
-          });
+        let msg: unknown;
+        try {
+          msg = JSON.parse(raw.toString());
+        } catch {
+          return;
         }
-      } catch {
-        // Ignore malformed WS frames
+        if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return;
+        const m = msg as { type?: unknown; token?: unknown; device?: unknown };
+        if (m.type === 'ping') return void ws.send('{"type":"pong"}');
+        if (m.type !== 'hello' || conn.roomId) return;
+
+        const claims = typeof m.token === 'string' ? verifyToken(m.token) : null;
+        if (!claims) {
+          ws.send(JSON.stringify({ type: 'error', message: 'Session expired. Please pair again.' }));
+          return void ws.close(4003, 'unauthorized');
+        }
+        clearTimeout(helloTimer);
+        const d = (m.device && typeof m.device === 'object' ? m.device : {}) as Record<string, unknown>;
+        const str = (v: unknown, fallback: string, max: number) => (typeof v === 'string' && v.trim() ? v.slice(0, max) : fallback);
+        const device: PresentDevice = {
+          id: str(d.id, conn.id, 64),
+          name: str(d.name, 'Unknown device', 60),
+          type: d.type === 'mobile' || d.type === 'tablet' ? d.type : 'desktop',
+          method: claims.m,
+          joinedAt: new Date().toISOString(),
+        };
+        conn.roomId = claims.r;
+        const room = store.room(claims.r);
+        ws.send(JSON.stringify({ type: 'ready', roomId: room.id, items: room.items, devices: store.presence(room.id) }));
+        store.join(room.id, conn.id, device);
+      } catch (err) {
+        // A malformed message must never take the whole server down.
+        console.error('[ws] message error', err);
+        ws.close(1011, 'error');
       }
     });
 
     ws.on('close', () => {
-      const meta = clients.get(ws);
-      if (meta) {
-        clients.delete(ws);
-        const room = rooms.get(meta.roomId);
-        if (room) {
-          room.devices.delete(meta.clientId);
-          broadcastToRoom(room.roomId, {
-            type: 'presence:updated',
-            devices: serializeDevices(room),
-          });
-        }
-      }
+      clearTimeout(helloTimer);
+      conns.delete(conn);
+      if (conn.roomId) store.leave(conn.roomId, conn.id);
     });
   });
 
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  }
+  // Drop dead connections (phones going to sleep etc.).
+  setInterval(() => {
+    for (const c of conns) {
+      if (!c.alive) {
+        c.ws.terminate();
+        continue;
+      }
+      c.alive = false;
+      c.ws.ping();
+    }
+  }, 25_000).unref();
 
-  const PORT = 3000;
   server.listen(PORT, '0.0.0.0', () => {
-    console.log(`qrLinkShare server listening on http://0.0.0.0:${PORT}`);
+    console.log(`qrLinkShare running on http://localhost:${PORT}`);
   });
 }
 
-startServer();
+// Everything lives in RAM, so crashing would wipe every room for everyone.
+// Log unexpected errors instead of exiting.
+process.on('unhandledRejection', (err) => console.error('[unhandledRejection]', err));
+process.on('uncaughtException', (err) => console.error('[uncaughtException]', err));
+
+main();

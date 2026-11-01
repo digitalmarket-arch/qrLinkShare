@@ -6,7 +6,8 @@
  * shared items. For permanent storage, swap the `files` map for S3 / Cloudflare R2.
  *
  * Memory rules:
- *  - every item (file OR note) counts toward its room, its uploader and the server total;
+ *  - every item (file OR note) counts toward its room and the server total;
+ *  - per person: files count toward MAX_USER_MB, notes toward a separate small cap;
  *  - when the server is full, NEW uploads are refused. Nobody else's files are ever
  *    deleted to make room;
  *  - one uploader (IP address) may hold at most MAX_USER_MB (default: a quarter of the total).
@@ -29,7 +30,7 @@ const MAX_TOTAL_BYTES = Number(process.env.MAX_STORE_MB || 512) * 1024 * 1024;
 /** Per uploader (IP address). Default: a quarter of the server's storage. */
 const MAX_OWNER_BYTES = process.env.MAX_USER_MB ? Number(process.env.MAX_USER_MB) * 1024 * 1024 : Math.floor(MAX_TOTAL_BYTES / 4);
 /** Space kept free for notes and links, so big files can never block text sharing. */
-const NOTE_RESERVE_BYTES = Math.max(2 * 1024 * 1024, Math.floor(MAX_TOTAL_BYTES * 0.05));
+const NOTE_RESERVE_BYTES = Math.min(Math.max(2 * 1024 * 1024, Math.floor(MAX_TOTAL_BYTES * 0.05)), Math.floor(MAX_TOTAL_BYTES * 0.25));
 /** Notes/links one uploader may hold at once (keeps the reserve from being used up by one person). */
 const MAX_OWNER_NOTE_BYTES = 2 * 1024 * 1024;
 /** How long uploads still in flight from a device's old room are redirected after it pairs. */
@@ -49,8 +50,8 @@ export interface Room {
   devices: Map<string, PresentDevice>; // keyed by connection id
   pairing?: PairingCode;
   bytes: number;
-  /** This device just paired elsewhere; anything still arriving here goes there instead. */
-  movedTo?: { roomId: string; until: number };
+  /** Its creator (device `by`) just paired elsewhere; that device's late sends go there instead. */
+  movedTo?: { roomId: string; until: number; by: string };
 }
 
 /** A PIN record and its QR-token twin point at each other, so using one always revokes both. */
@@ -114,7 +115,10 @@ class Store {
   resolveRoom(claims: AccessClaims): string {
     if (claims.m !== 'guest') return claims.r;
     const moved = this.rooms.get(claims.r)?.movedTo;
-    return moved && moved.until > Date.now() ? moved.roomId : claims.r;
+    if (!moved || moved.until < Date.now()) return claims.r;
+    // If anyone else is back in the old room, it's in use again: stop redirecting.
+    if (this.presence(claims.r).some((d) => d.id !== moved.by)) return claims.r;
+    return moved.roomId;
   }
 
   /* ------------------------------- items ------------------------------- */
@@ -124,7 +128,10 @@ class Store {
     // Files may not use the last few MB, so notes and links keep working when big files fill the server.
     const limit = kind === 'file' ? MAX_TOTAL_BYTES - NOTE_RESERVE_BYTES : MAX_TOTAL_BYTES;
     if (this.totalBytes + bytes > limit) return 'The server is full right now. Please try again later.';
-    if ((this.ownerBytes.get(owner) ?? 0) + bytes > MAX_OWNER_BYTES) {
+    // Files count against the per-person cap; notes have their own small cap below,
+    // so someone's big files never stop them sending a quick link.
+    const ownerFileBytes = (this.ownerBytes.get(owner) ?? 0) - (this.ownerNoteBytes.get(owner) ?? 0);
+    if (kind === 'file' && ownerFileBytes + bytes > MAX_OWNER_BYTES) {
       return 'You are storing a lot already. Delete some items or wait for them to expire.';
     }
     if (kind === 'note' && (this.ownerNoteBytes.get(owner) ?? 0) + bytes > MAX_OWNER_NOTE_BYTES) {
@@ -206,11 +213,11 @@ class Store {
    * what it shared, so a note sent before pairing isn't lost, and send anything
    * still uploading to the new room too. The caller checks that it's safe.
    */
-  moveItems(fromRoomId: string, toRoomId: string) {
+  moveItems(fromRoomId: string, toRoomId: string, byDeviceId: string) {
     if (fromRoomId === toRoomId) return;
     const from = this.room(fromRoomId);
     const to = this.room(toRoomId);
-    from.movedTo = { roomId: toRoomId, until: Date.now() + MOVED_TO_TTL_MS };
+    from.movedTo = { roomId: toRoomId, until: Date.now() + MOVED_TO_TTL_MS, by: byDeviceId };
     // Nobody new should join a room its creator just left.
     if (from.pairing) this.revoke(from.pairing.pin, from.pairing.pairToken);
     from.pairing = undefined;
@@ -248,6 +255,7 @@ class Store {
   /** Creates a fresh one-time PIN + QR token for a room (replacing the old one). */
   createPairing(roomId: string): PairingCode {
     const room = this.room(roomId);
+    room.movedTo = undefined; // the room is being used again
     if (room.pairing) this.revoke(room.pairing.pin, room.pairing.pairToken);
     room.pairing = undefined;
     let pin = '';
@@ -274,6 +282,7 @@ class Store {
     this.revoke(rec.pin, rec.pairToken);
     const room = this.room(rec.roomId);
     if (room.pairing?.pin === rec.pin) room.pairing = undefined;
+    room.movedTo = undefined;
     this.emit(room.id, { type: 'pair:used', by: device });
     return room.id;
   }
@@ -281,7 +290,9 @@ class Store {
   /* ------------------------------ presence ----------------------------- */
 
   join(roomId: string, connId: string, device: PresentDevice) {
-    this.room(roomId).devices.set(connId, device);
+    const room = this.room(roomId);
+    if (room.movedTo && room.movedTo.by !== device.id) room.movedTo = undefined; // someone came back
+    room.devices.set(connId, device);
     this.emitPresence(roomId);
   }
 

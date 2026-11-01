@@ -28,19 +28,28 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
 const IS_PROD = process.env.NODE_ENV === 'production' || process.argv.includes('--prod');
 const list = (v: string | undefined) => (v || '').split(',').map((s) => s.trim()).filter(Boolean);
-/** "https://Share.Example.com/" -> "https://share.example.com" (so copy-pasted values still match). */
+/**
+ * "https://Share.Example.com/" -> "https://share.example.com", so copy-pasted values still match.
+ * Other schemes (e.g. capacitor://localhost) are kept as written, minus a trailing slash.
+ */
 const normOrigin = (o: string): string | null => {
   try {
-    return new URL(o).origin;
+    const u = new URL(o);
+    if (u.protocol === 'http:' || u.protocol === 'https:') return u.origin;
+    const kept = o.trim().replace(/\/+$/, '');
+    return kept.toLowerCase() === 'null' ? null : kept;
   } catch {
     console.warn(`[config] Ignoring invalid origin "${o}"`);
     return null;
   }
 };
-const origins = (v: string | undefined) => list(v).map(normOrigin).filter((o): o is string => !!o);
-const ALLOWED_ORIGINS = list(process.env.ALLOWED_ORIGINS || '*').includes('*') ? ['*'] : origins(process.env.ALLOWED_ORIGINS);
+const origins = (values: string[]) => values.map(normOrigin).filter((o): o is string => !!o);
+const isWebOrigin = (o: string) => /^https?:\/\//.test(o);
+const rawAllowed = list(process.env.ALLOWED_ORIGINS || '*');
+/** '*' (any site may call the API) can be combined with explicit sites, which wallet sign-in needs. */
+const ALLOWED_ORIGINS = [...(rawAllowed.includes('*') ? ['*'] : []), ...origins(rawAllowed.filter((o) => o !== '*'))];
 /** This site's own public address(es), e.g. https://share.example.com. Required for wallet sign-in on most hosts. */
-const PUBLIC_ORIGINS = origins(process.env.PUBLIC_ORIGIN);
+const PUBLIC_ORIGINS = origins(list(process.env.PUBLIC_ORIGIN)).filter(isWebOrigin);
 /** Render sets this automatically (and only routes requests for this service's own domains to it). */
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL ? normOrigin(process.env.RENDER_EXTERNAL_URL) : null;
 const UPLOAD_BYTES_PER_HOUR = Number(process.env.UPLOAD_MB_PER_HOUR || 300) * 1024 * 1024;
@@ -106,7 +115,7 @@ function refuseOrigin(origin: string, hint: string): null {
 function siteOriginFor(req: Request): string | null {
   const raw = req.headers.origin;
   const origin = raw && raw !== 'null' ? raw : null;
-  const explicit = [...PUBLIC_ORIGINS, ...ALLOWED_ORIGINS.filter((o) => o !== '*'), ...(RENDER_URL ? [RENDER_URL] : [])];
+  const explicit = [...PUBLIC_ORIGINS, ...ALLOWED_ORIGINS.filter(isWebOrigin), ...(RENDER_URL ? [RENDER_URL] : [])];
   if (!origin) return explicit[0] ?? null;
   if (explicit.includes(origin)) return origin;
   if (PUBLIC_ORIGINS.length) {
@@ -120,7 +129,9 @@ function siteOriginFor(req: Request): string | null {
     return null;
   }
   const host = String(req.headers.host || '');
-  if (originHost !== host) return null;
+  if (originHost !== host) {
+    return refuseOrigin(origin, 'If this is your own frontend (e.g. GitHub Pages), add it to ALLOWED_ORIGINS or PUBLIC_ORIGIN.');
+  }
   if (RENDER_URL || isLocalHost(host)) return origin;
   return refuseOrigin(origin, `Set PUBLIC_ORIGIN=${origin} to enable wallet sign-in on this host.`);
 }
@@ -137,7 +148,7 @@ function carryOver(fromToken: unknown, toRoomId: string, deviceId: string) {
   const room = store.rooms.get(from.r);
   if (room?.items.some((i) => i.from.id !== deviceId)) return;
   if (store.presence(from.r).some((d) => d.id !== deviceId)) return;
-  store.moveItems(from.r, toRoomId);
+  store.moveItems(from.r, toRoomId, deviceId);
 }
 
 /** Per-IP upload budget, so one client can't fill the whole server's memory. */

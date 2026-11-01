@@ -56,18 +56,19 @@ export function Composer({ session, peerCount, onSent }: Props) {
       }
       return;
     }
+    // The text stays in the box until we know it arrived, so nothing is ever lost.
     setSending(true);
     const sent = text;
-    setText('');
     try {
       const { item } = await api.sendText(session, value);
       if (item.roomId !== sessionRef.current.roomId) {
-        // We switched rooms while it was sending: say so and give the text back.
-        toast({ tone: 'info', title: 'Sent to the room you just left', body: 'It’s back in the box if you want to send it here too.' });
-        setText((t) => t || sent);
-      } else onSent(item);
+        // We switched rooms while it was sending: say so and keep the text.
+        toast({ tone: 'info', title: 'Sent to the room you just left', body: 'It’s still in the box if you want to send it here too.' });
+      } else {
+        onSent(item);
+        setText((t) => (t === sent ? '' : t));
+      }
     } catch (err) {
-      setText((t) => t || sent);
       toast({ tone: 'error', title: 'Not sent', body: err instanceof Error ? err.message : undefined });
     } finally {
       setSending(false);

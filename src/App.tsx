@@ -119,6 +119,21 @@ function Shell() {
     runBoot();
   }, []);
 
+  // If another tab of this browser pairs or signs in, follow it into the new room.
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== 'qrls.session' || !e.newValue) return;
+      try {
+        const next = JSON.parse(e.newValue) as RoomSession;
+        if (next?.token) setSession((cur) => (cur?.token === next.token ? cur : next));
+      } catch {
+        // ignore malformed values
+      }
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
+
   // Load Google sign-in ahead of time. Safari/iOS only allow the sign-in popup if it
   // opens right after the tap, with no downloading in between.
   useEffect(() => {

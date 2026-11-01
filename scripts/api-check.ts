@@ -157,6 +157,15 @@ async function main() {
   const memberNote = await post(`/api/rooms/${host.roomId}/items`, { text: 'member secret' }, { ...auth(member), 'X-Device-Id': 'member-1' });
   check("other members' sends never follow the creator into a new room", memberNote.data.item?.roomId === host.roomId);
 
+  // If the creator reopens its old room (e.g. a second tab shows a new code), the redirect ends.
+  const h2 = (await post('/api/rooms', {})).data;
+  const s2 = (await post('/api/rooms', {})).data;
+  const s2Code = (await post(`/api/rooms/${s2.roomId}/pair`, {}, auth(s2))).data;
+  await post('/api/pair/claim', { pin: s2Code.pin, fromToken: h2.token }, { 'X-Device-Id': 'h2-dev' });
+  await post(`/api/rooms/${h2.roomId}/pair`, {}, auth(h2));
+  const reopened = await post(`/api/rooms/${h2.roomId}/items`, { text: 'meant for old room' }, { ...auth(h2), 'X-Device-Id': 'h2-dev' });
+  check('reopening the old room ends the redirect', reopened.data.item?.roomId === h2.roomId);
+
   /* ---------------------------- websocket safety --------------------------- */
   const crash = async (frame: string) =>
     new Promise<void>((resolve) => {

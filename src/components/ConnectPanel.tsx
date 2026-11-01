@@ -88,11 +88,11 @@ export function ConnectPanel(props: Props) {
                 role="tab"
                 aria-selected={tab === t.id}
                 onClick={() => setTab(t.id)}
-                className={`min-h-10 rounded-lg text-sm font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
+                className={`min-h-10 px-1 rounded-lg text-sm font-semibold whitespace-nowrap flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
                   tab === t.id ? 'bg-surface text-ink shadow-sm' : 'text-muted hover:text-ink'
                 }`}
               >
-                <t.icon className="w-4 h-4" />
+                <t.icon className="w-4 h-4 shrink-0 max-[399px]:hidden" />
                 {t.label}
               </button>
             ))}

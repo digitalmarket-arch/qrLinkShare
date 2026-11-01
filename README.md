@@ -62,21 +62,14 @@ The site has two parts:
 **Step 1: Start the server on Render**
 1. Go to [render.com](https://render.com) and sign up with your GitHub account.
 2. Click **New → Blueprint**, pick **digitalmarket-arch/qrLinkShare**, then **Apply**. `render.yaml` already has every setting (Singapore region, closest to India; a random secret; permission for the GitHub Pages address).
-3. Wait 3-5 minutes until it says **Live**. Copy its address, e.g. `https://qrlinkshare.onrender.com`. (If that name is taken, Render adds a few letters. Use whatever it shows.)
+3. Wait 3-5 minutes until it says **Live**. Its address should be `https://qrlinkshare-digitalmarket.onrender.com`. That's the address the GitHub Pages site already uses.
 
-**Step 2: Turn on GitHub Pages**
-1. In the GitHub repo: **Settings → Pages → Build and deployment → Source: GitHub Actions**.
+**Step 2: The page on GitHub Pages**
+It publishes automatically on every push to `main` (Actions tab → "Deploy qrLinkShare to GitHub Pages"), at `https://digitalmarket-arch.github.io/qrLinkShare/`. GitHub Pages must use **Settings → Pages → Source: GitHub Actions**.
 
-**Step 3: Tell the page where the server is**
-1. **Settings → Secrets and variables → Actions → Variables tab → New repository variable**
-2. Name: `VITE_SERVER_URL`. Value: the Render address from step 1, with no `/` at the end.
+If Render gave your server a different address, set the repository variable `VITE_SERVER_URL` to it (Settings → Secrets and variables → Actions → Variables), then re-run the workflow.
 
-**Step 4: Publish**
-1. **Actions tab → "Deploy qrLinkShare to GitHub Pages" → Run workflow** (branch `main`).
-2. About 2 minutes later the site is live at `https://digitalmarket-arch.github.io/qrLinkShare/`.
-3. After that, every change merged into `main` republishes automatically.
-
-**Step 5: Allow Google sign-in on the new address.** See "Google sign-in setup" below. Add `digitalmarket-arch.github.io`.
+**Step 3: Allow Google sign-in on the new address.** See "Google sign-in setup" below. Add `digitalmarket-arch.github.io`.
 
 ### Free plan caveats
 - The server sleeps after 15 minutes without visitors. The next visitor sees "Waking up the server…" for up to a minute. Because files are kept in memory, a sleep or restart also clears shared items.
@@ -90,7 +83,7 @@ The Render address also works on its own as a complete copy of the site. Any Nod
 Google login uses Firebase Authentication (project settings in `firebase-applet-config.json`). In the [Firebase console](https://console.firebase.google.com):
 
 1. **Authentication → Sign-in method** → enable **Google**.
-2. **Authentication → Settings → Authorized domains** → add `digitalmarket-arch.github.io` and your Render domain (e.g. `qrlinkshare.onrender.com`).
+2. **Authentication → Settings → Authorized domains** → add `digitalmarket-arch.github.io` and your Render domain (`qrlinkshare-digitalmarket.onrender.com`).
 
 To use your own Firebase project, replace the values in `firebase-applet-config.json`. The Firebase web config is meant to be public. The server checks every Google token itself.
 

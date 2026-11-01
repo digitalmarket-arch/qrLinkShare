@@ -1,8 +1,9 @@
 name: Deploy qrLinkShare to GitHub Pages
 
-# The page on GitHub Pages talks to the live server (deployed separately, e.g. on
-# Render with render.yaml). Set the repository variable VITE_SERVER_URL to that
-# server's address: Settings → Secrets and variables → Actions → Variables.
+# The page on GitHub Pages talks to the live server, deployed separately on Render
+# with render.yaml (https://qrlinkshare-digitalmarket.onrender.com). To use another
+# server, set the repository variable VITE_SERVER_URL:
+# Settings → Secrets and variables → Actions → Variables.
 
 on:
   push:
@@ -20,26 +21,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    outputs:
-      ready: ${{ steps.check.outputs.ready }}
-    steps:
-      - id: check
-        env:
-          SERVER_URL: ${{ vars.VITE_SERVER_URL }}
-        run: |
-          if [ -z "$SERVER_URL" ]; then
-            echo "::warning title=Not deployed yet::Set the repository variable VITE_SERVER_URL to your server address (e.g. https://qrlinkshare.onrender.com), then run this workflow again from the Actions tab."
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "Deploying with server $SERVER_URL"
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          fi
-
   build:
-    needs: check
-    if: needs.check.outputs.ready == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -61,7 +43,7 @@ jobs:
 
       - name: Build the page
         env:
-          VITE_SERVER_URL: ${{ vars.VITE_SERVER_URL }}
+          VITE_SERVER_URL: ${{ vars.VITE_SERVER_URL || 'https://qrlinkshare-digitalmarket.onrender.com' }}
         run: |
           npm run build
           cp dist/index.html dist/404.html

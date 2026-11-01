@@ -1,7 +1,7 @@
 # One-click deploy on Render (https://render.com): New → Blueprint → pick this repo.
 services:
   - type: web
-    name: qrlinkshare
+    name: qrlinkshare-digitalmarket # gives https://qrlinkshare-digitalmarket.onrender.com
     runtime: node
     region: singapore # closest Render region to India
     plan: free # 512 MB RAM. Keep the storage caps below well under that.

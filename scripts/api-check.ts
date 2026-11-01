@@ -147,6 +147,16 @@ async function main() {
   });
   check("a paired device can't move the room's items away", deskAfter.some((i) => i.text === 'desk private note'));
 
+  // When a room's creator moves to another room, the OTHER members' sends must stay put.
+  const host = (await post('/api/rooms', {})).data;
+  const hostCode = (await post(`/api/rooms/${host.roomId}/pair`, {}, auth(host))).data;
+  const member = (await post('/api/pair/claim', { pin: hostCode.pin }, { 'X-Device-Id': 'member-1' })).data;
+  const stranger = (await post('/api/rooms', {})).data;
+  const strangerCode = (await post(`/api/rooms/${stranger.roomId}/pair`, {}, auth(stranger))).data;
+  await post('/api/pair/claim', { pin: strangerCode.pin, fromToken: host.token }, { 'X-Device-Id': 'host-1' });
+  const memberNote = await post(`/api/rooms/${host.roomId}/items`, { text: 'member secret' }, { ...auth(member), 'X-Device-Id': 'member-1' });
+  check("other members' sends never follow the creator into a new room", memberNote.data.item?.roomId === host.roomId);
+
   /* ---------------------------- websocket safety --------------------------- */
   const crash = async (frame: string) =>
     new Promise<void>((resolve) => {

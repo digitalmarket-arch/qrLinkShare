@@ -28,11 +28,21 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
 const IS_PROD = process.env.NODE_ENV === 'production' || process.argv.includes('--prod');
 const list = (v: string | undefined) => (v || '').split(',').map((s) => s.trim()).filter(Boolean);
-const ALLOWED_ORIGINS = list(process.env.ALLOWED_ORIGINS || '*');
+/** "https://Share.Example.com/" -> "https://share.example.com" (so copy-pasted values still match). */
+const normOrigin = (o: string): string | null => {
+  try {
+    return new URL(o).origin;
+  } catch {
+    console.warn(`[config] Ignoring invalid origin "${o}"`);
+    return null;
+  }
+};
+const origins = (v: string | undefined) => list(v).map(normOrigin).filter((o): o is string => !!o);
+const ALLOWED_ORIGINS = list(process.env.ALLOWED_ORIGINS || '*').includes('*') ? ['*'] : origins(process.env.ALLOWED_ORIGINS);
 /** This site's own public address(es), e.g. https://share.example.com. Required for wallet sign-in on most hosts. */
-const PUBLIC_ORIGINS = list(process.env.PUBLIC_ORIGIN);
+const PUBLIC_ORIGINS = origins(process.env.PUBLIC_ORIGIN);
 /** Render sets this automatically (and only routes requests for this service's own domains to it). */
-const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL ? normOrigin(process.env.RENDER_EXTERNAL_URL) : null;
 const UPLOAD_BYTES_PER_HOUR = Number(process.env.UPLOAD_MB_PER_HOUR || 300) * 1024 * 1024;
 // Uploaded files never live outside RAM, so a plain-text note must declare UTF-8 to display correctly.
 const withCharset = (mime: string) => (/^text\/plain$/i.test(mime) ? 'text/plain; charset=utf-8' : mime);
@@ -85,14 +95,24 @@ const isLocalHost = (host: string) =>
  *    trusted: on Render (which routes by domain) or on localhost / your home network.
  * Returns null for anything else.
  */
-let warnedOrigin = false;
+const warnedOrigins = new Set<string>();
+function refuseOrigin(origin: string, hint: string): null {
+  if (warnedOrigins.size < 50 && !warnedOrigins.has(origin)) {
+    warnedOrigins.add(origin);
+    console.warn(`[wallet] Refused sign-in from ${origin}. ${hint}`);
+  }
+  return null;
+}
 function siteOriginFor(req: Request): string | null {
   const raw = req.headers.origin;
   const origin = raw && raw !== 'null' ? raw : null;
   const explicit = [...PUBLIC_ORIGINS, ...ALLOWED_ORIGINS.filter((o) => o !== '*'), ...(RENDER_URL ? [RENDER_URL] : [])];
   if (!origin) return explicit[0] ?? null;
   if (explicit.includes(origin)) return origin;
-  if (PUBLIC_ORIGINS.length) return null; // the operator listed the site's addresses; nothing else counts
+  if (PUBLIC_ORIGINS.length) {
+    // The operator listed the site's addresses; nothing else counts.
+    return refuseOrigin(origin, `PUBLIC_ORIGIN lists ${PUBLIC_ORIGINS.join(', ')}. Add this address if it is yours.`);
+  }
   let originHost = '';
   try {
     originHost = new URL(origin).host;
@@ -102,11 +122,7 @@ function siteOriginFor(req: Request): string | null {
   const host = String(req.headers.host || '');
   if (originHost !== host) return null;
   if (RENDER_URL || isLocalHost(host)) return origin;
-  if (!warnedOrigin) {
-    warnedOrigin = true;
-    console.warn(`[wallet] Refused sign-in from ${origin}. Set PUBLIC_ORIGIN=${origin} to enable wallet sign-in on this host.`);
-  }
-  return null;
+  return refuseOrigin(origin, `Set PUBLIC_ORIGIN=${origin} to enable wallet sign-in on this host.`);
 }
 
 /**
@@ -297,9 +313,9 @@ async function main() {
     const url = toHttpUrl(text);
     const content = url ? { url } : { text: raw.replace(/^\s*\n|\s+$/g, '') };
     const owner = req.ip || '';
-    const refused = store.refuse(owner, itemCost(content));
+    const refused = store.refuse(owner, itemCost(content), 'note');
     if (refused) return void res.status(507).json({ error: refused });
-    const item = store.addItem(store.resolveRoom(req.claims!.r), owner, {
+    const item = store.addItem(store.resolveRoom(req.claims!), owner, {
       kind: url ? 'link' : 'text',
       ...content,
       from: readDevice(req),
@@ -317,7 +333,7 @@ async function main() {
       if (declared > uploadBudgetLeft(req.ip || '')) {
         return void res.status(429).json({ error: 'Upload limit reached for now. Please try again in an hour.' });
       }
-      const refused = store.refuse(req.ip || '', declared);
+      const refused = store.refuse(req.ip || '', declared, 'file');
       if (refused) return void res.status(507).json({ error: refused });
       next();
     },
@@ -331,7 +347,7 @@ async function main() {
       if (data.length > uploadBudgetLeft(owner)) {
         return void res.status(429).json({ error: 'Upload limit reached for now. Please try again in an hour.' });
       }
-      const refused = store.refuse(owner, data.length);
+      const refused = store.refuse(owner, data.length, 'file');
       if (refused) return void res.status(507).json({ error: refused });
       chargeUpload(owner, data.length);
       let name = 'file';
@@ -342,7 +358,7 @@ async function main() {
       }
       const mime = String(req.headers['content-type'] || 'application/octet-stream').split(';')[0].slice(0, 100);
       const item = store.addItem(
-        store.resolveRoom(req.claims!.r),
+        store.resolveRoom(req.claims!),
         owner,
         {
           kind: 'file',
@@ -421,7 +437,17 @@ async function main() {
 
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 16 * 1024 });
-  wss.on('error', (err) => console.error('[ws] server error', err));
+  // A port that can't be opened must stop the process with an error code (so the host restarts it).
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.syscall === 'listen') {
+      console.error(`[server] Cannot start on port ${PORT}:`, err.message);
+      process.exit(1);
+    }
+    console.error('[server] error', err);
+  });
+  wss.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.syscall !== 'listen') console.error('[ws] server error', err);
+  });
 
   interface Conn {
     ws: WebSocket;

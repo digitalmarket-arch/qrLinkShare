@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Archive,
   Copy,
@@ -11,6 +11,7 @@ import {
   FileText,
   Film,
   Link2,
+  Loader2,
   Monitor,
   Music,
   Presentation,
@@ -75,12 +76,14 @@ export function ItemCard({ item, myDeviceId, fresh, onCopy, onShowQr, onDelete }
 
   const canNativeShare = typeof navigator !== 'undefined' && 'share' in navigator && matchMedia('(pointer: coarse)').matches;
 
-  // Browsers only open the share sheet straight from a tap, so a file must already be
-  // downloaded by then. We start downloading when the finger touches Share (never in
-  // the background); if it isn't ready by the tap, the button asks for a second tap.
+  // Sharing a real file (e.g. a photo to WhatsApp) needs it downloaded first. We start
+  // when the finger touches Share (never in the background), wait up to ~3 s on the
+  // tap itself, and only if that's not enough ask for a second tap. Types the phone
+  // can't share as files (e.g. .docx on Android) share the link straight away.
   const SHARE_FILE_MAX = 10 * 1024 * 1024;
   const shareFile = useRef<File | null>(null);
-  const [shareState, setShareState] = useState<'idle' | 'loading' | 'ready'>('idle');
+  const shareFetch = useRef<Promise<File | null> | null>(null);
+  const [shareState, setShareState] = useState<'idle' | 'loading' | 'ready' | 'failed'>('idle');
   useEffect(
     () => () => {
       shareFile.current = null; // release memory when the card goes away
@@ -88,31 +91,63 @@ export function ItemCard({ item, myDeviceId, fresh, onCopy, onShowQr, onDelete }
     []
   );
 
-  const prepareShare = () => {
+  const fileShareable = useMemo(() => {
+    const m = item.file;
+    if (!canNativeShare || !m || m.size > SHARE_FILE_MAX || typeof navigator.canShare !== 'function') return false;
+    try {
+      return navigator.canShare({ files: [new window.File([], m.name, { type: m.mime })] });
+    } catch {
+      return false;
+    }
+  }, [item.file?.fileId, canNativeShare]);
+
+  /**
+   * Starts downloading the file. Silent on purpose: the button must not change size
+   * while the finger is still on it, or the tap wouldn't count as a click.
+   */
+  const prepareShare = (): Promise<File | null> => {
     const meta = item.file;
-    if (!meta || meta.size > SHARE_FILE_MAX || shareState !== 'idle') return;
-    setShareState('loading');
-    fetch(fileUrl(meta.fileId))
-      .then((r) => (r.ok ? r.blob() : Promise.reject()))
+    if (!meta || !fileShareable) return Promise.resolve(null);
+    if (shareFetch.current) return shareFetch.current;
+    shareFetch.current = fetch(fileUrl(meta.fileId))
+      .then((r) => (r.ok ? r.blob() : Promise.reject(r.status)))
       .then((blob) => {
-        shareFile.current = new window.File([blob], meta.name, { type: meta.mime });
-        setShareState('ready');
+        const f = new window.File([blob], meta.name, { type: meta.mime });
+        shareFile.current = f;
+        setShareState((st) => (st === 'loading' ? 'ready' : st));
+        return f;
       })
-      .catch(() => setShareState('idle'));
+      .catch(() => {
+        shareFetch.current = null;
+        setShareState('failed');
+        return null;
+      });
+    return shareFetch.current;
   };
 
-  const nativeShare = () => {
-    let p: Promise<void>;
-    if (item.file) {
-      const f = shareFile.current;
-      if (f && navigator.canShare?.({ files: [f] })) p = navigator.share({ files: [f], title: item.file.name });
-      else if (item.file.size <= SHARE_FILE_MAX && shareState !== 'ready') {
-        prepareShare(); // still downloading: the button shows "tap again"
-        return;
-      } else p = navigator.share({ url: fileUrl(item.file.fileId), title: item.file.name });
-    } else if (item.url) p = navigator.share({ url: item.url });
-    else p = navigator.share({ text: item.text ?? '' });
-    p.catch(() => {}); // cancelled
+  const shareLink = () =>
+    navigator.share(item.file ? { url: fileUrl(item.file.fileId), title: item.file.name } : item.url ? { url: item.url } : { text: item.text ?? '' });
+
+  const nativeShare = async () => {
+    if (!item.file || !fileShareable) return void shareLink().catch(() => {});
+    if (shareState === 'failed') {
+      // Couldn't download it: share the link instead, in this same tap.
+      setShareState('idle');
+      return void shareLink().catch(() => {});
+    }
+    let f = shareFile.current;
+    if (!f) {
+      setShareState('loading');
+      f = await Promise.race([prepareShare(), new Promise<null>((r) => setTimeout(() => r(null), 3000))]);
+      if (!f) return; // still downloading: the button now says "Preparing…" then "Tap to share"
+    }
+    setShareState('idle');
+    try {
+      await navigator.share({ files: [f], title: item.file.name });
+    } catch (err) {
+      // Some browsers refuse because the tap is "too old" after the wait; a second tap works.
+      if ((err as DOMException)?.name === 'NotAllowedError') setShareState('ready');
+    }
   };
 
   return (
@@ -209,13 +244,25 @@ export function ItemCard({ item, myDeviceId, fresh, onCopy, onShowQr, onDelete }
         {canNativeShare && (
           <button
             type="button"
-            className={`icon-btn relative ${shareState === 'loading' ? 'animate-pulse' : ''}`}
-            aria-label={shareState === 'loading' ? 'Preparing file to share' : shareState === 'ready' ? 'File ready, tap to share' : 'Share to another app'}
-            onPointerDown={prepareShare}
+            className={`relative inline-flex items-center gap-1.5 h-10 rounded-xl cursor-pointer transition-colors ${
+              shareState === 'idle' ? 'icon-btn' : 'px-3 bg-brand-soft text-brand text-xs font-semibold'
+            }`}
+            aria-label={
+              shareState === 'loading'
+                ? 'Preparing file to share'
+                : shareState === 'ready'
+                  ? 'File ready, tap to share'
+                  : shareState === 'failed'
+                    ? 'Could not download the file. Tap to share its link'
+                    : 'Share to another app'
+            }
+            onPointerDown={() => void prepareShare()}
             onClick={nativeShare}
           >
-            <Share2 className="w-4 h-4" />
-            {shareState === 'ready' && <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-live" />}
+            {shareState === 'loading' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Share2 className="w-4 h-4" />}
+            {shareState === 'loading' && <span>Preparing…</span>}
+            {shareState === 'ready' && <span>Tap to share</span>}
+            {shareState === 'failed' && <span>Share link</span>}
           </button>
         )}
         {item.kind !== 'text' && (

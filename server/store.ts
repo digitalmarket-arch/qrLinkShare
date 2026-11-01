@@ -18,7 +18,7 @@ import type {
   PresentDevice,
   SharedItem,
 } from '../src/types/share';
-import { randomId, randomPin } from './tokens';
+import { randomId, randomPin, type AccessClaims } from './tokens';
 
 const HOUR = 60 * 60 * 1000;
 export const ITEM_TTL_MS = Number(process.env.ITEM_TTL_HOURS || 24) * HOUR;
@@ -28,6 +28,10 @@ export const MAX_ROOM_BYTES = Number(process.env.MAX_ROOM_MB || 200) * 1024 * 10
 const MAX_TOTAL_BYTES = Number(process.env.MAX_STORE_MB || 512) * 1024 * 1024;
 /** Per uploader (IP address). Default: a quarter of the server's storage. */
 const MAX_OWNER_BYTES = process.env.MAX_USER_MB ? Number(process.env.MAX_USER_MB) * 1024 * 1024 : Math.floor(MAX_TOTAL_BYTES / 4);
+/** Space kept free for notes and links, so big files can never block text sharing. */
+const NOTE_RESERVE_BYTES = Math.max(2 * 1024 * 1024, Math.floor(MAX_TOTAL_BYTES * 0.05));
+/** Notes/links one uploader may hold at once (keeps the reserve from being used up by one person). */
+const MAX_OWNER_NOTE_BYTES = 2 * 1024 * 1024;
 /** How long uploads still in flight from a device's old room are redirected after it pairs. */
 const MOVED_TO_TTL_MS = 15 * 60 * 1000;
 
@@ -73,8 +77,9 @@ class Store {
   pairTokens = new Map<string, PairRecord>();
   totalBytes = 0;
   /** itemId -> who stored it and how much memory it uses */
-  private sizes = new Map<string, { bytes: number; owner: string }>();
+  private sizes = new Map<string, { bytes: number; owner: string; note: boolean }>();
   private ownerBytes = new Map<string, number>();
+  private ownerNoteBytes = new Map<string, number>();
   private listener: Listener = () => {};
 
   onEvent(listener: Listener) {
@@ -101,19 +106,29 @@ class Store {
     return id;
   }
 
-  /** Where new items for this room should go (follows a recent move after pairing). */
-  resolveRoom(roomId: string): string {
-    const moved = this.rooms.get(roomId)?.movedTo;
-    return moved && moved.until > Date.now() ? moved.roomId : roomId;
+  /**
+   * Where a new item from this token should go. Only the room's creator (the 'guest'
+   * token, i.e. the device that just moved) follows a recent move; every other member
+   * of the old room keeps writing to the old room.
+   */
+  resolveRoom(claims: AccessClaims): string {
+    if (claims.m !== 'guest') return claims.r;
+    const moved = this.rooms.get(claims.r)?.movedTo;
+    return moved && moved.until > Date.now() ? moved.roomId : claims.r;
   }
 
   /* ------------------------------- items ------------------------------- */
 
-  /** Returns a user-facing reason if this upload can't be stored right now, else null. */
-  refuse(owner: string, bytes: number): string | null {
-    if (this.totalBytes + bytes > MAX_TOTAL_BYTES) return 'The server is full right now. Please try again later.';
+  /** Returns a user-facing reason if this item can't be stored right now, else null. */
+  refuse(owner: string, bytes: number, kind: 'file' | 'note'): string | null {
+    // Files may not use the last few MB, so notes and links keep working when big files fill the server.
+    const limit = kind === 'file' ? MAX_TOTAL_BYTES - NOTE_RESERVE_BYTES : MAX_TOTAL_BYTES;
+    if (this.totalBytes + bytes > limit) return 'The server is full right now. Please try again later.';
     if ((this.ownerBytes.get(owner) ?? 0) + bytes > MAX_OWNER_BYTES) {
       return 'You are storing a lot already. Delete some items or wait for them to expire.';
+    }
+    if (kind === 'note' && (this.ownerNoteBytes.get(owner) ?? 0) + bytes > MAX_OWNER_NOTE_BYTES) {
+      return 'You have shared a lot of notes already. Delete some or send long text as a file.';
     }
     return null;
   }
@@ -138,8 +153,10 @@ class Store {
       this.files.set(full.file.fileId, { meta: full.file, roomId, itemId: full.id, data, expiresAt: now + ITEM_TTL_MS });
     }
     const bytes = itemCost(full, data);
-    this.sizes.set(full.id, { bytes, owner });
+    const note = !full.file;
+    this.sizes.set(full.id, { bytes, owner, note });
     this.ownerBytes.set(owner, (this.ownerBytes.get(owner) ?? 0) + bytes);
+    if (note) this.ownerNoteBytes.set(owner, (this.ownerNoteBytes.get(owner) ?? 0) + bytes);
     room.bytes += bytes;
     this.totalBytes += bytes;
 
@@ -157,9 +174,13 @@ class Store {
     this.sizes.delete(item.id);
     room.bytes -= size.bytes;
     this.totalBytes -= size.bytes;
-    const left = (this.ownerBytes.get(size.owner) ?? 0) - size.bytes;
-    if (left > 0) this.ownerBytes.set(size.owner, left);
-    else this.ownerBytes.delete(size.owner);
+    const dec = (map: Map<string, number>) => {
+      const left = (map.get(size.owner) ?? 0) - size.bytes;
+      if (left > 0) map.set(size.owner, left);
+      else map.delete(size.owner);
+    };
+    dec(this.ownerBytes);
+    if (size.note) dec(this.ownerNoteBytes);
   }
 
   removeItem(roomId: string, itemId: string): boolean {
@@ -190,6 +211,9 @@ class Store {
     const from = this.room(fromRoomId);
     const to = this.room(toRoomId);
     from.movedTo = { roomId: toRoomId, until: Date.now() + MOVED_TO_TTL_MS };
+    // Nobody new should join a room its creator just left.
+    if (from.pairing) this.revoke(from.pairing.pin, from.pairing.pairToken);
+    from.pairing = undefined;
     if (from.items.length === 0) return;
     const moving = [...from.items].reverse(); // oldest first
     from.items = [];

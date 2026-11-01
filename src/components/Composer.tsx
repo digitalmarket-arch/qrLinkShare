@@ -45,8 +45,9 @@ export function Composer({ session, peerCount, onSent }: Props) {
       if (!upload) return;
       setSending(true);
       try {
-        await upload;
-        setText((t) => (t === sent ? '' : t));
+        const item = await upload;
+        // Only clear the box if it really arrived in the room we're in now.
+        if (item.roomId === sessionRef.current.roomId) setText((t) => (t === sent ? '' : t));
       } catch {
         // addFiles already showed the error toast
       } finally {
@@ -56,11 +57,17 @@ export function Composer({ session, peerCount, onSent }: Props) {
       return;
     }
     setSending(true);
+    const sent = text;
+    setText('');
     try {
       const { item } = await api.sendText(session, value);
-      onSent(item);
-      setText('');
+      if (item.roomId !== sessionRef.current.roomId) {
+        // We switched rooms while it was sending: say so and give the text back.
+        toast({ tone: 'info', title: 'Sent to the room you just left', body: 'It’s back in the box if you want to send it here too.' });
+        setText((t) => t || sent);
+      } else onSent(item);
     } catch (err) {
+      setText((t) => t || sent);
       toast({ tone: 'error', title: 'Not sent', body: err instanceof Error ? err.message : undefined });
     } finally {
       setSending(false);
@@ -97,7 +104,7 @@ export function Composer({ session, peerCount, onSent }: Props) {
       promise
         .then((item) => {
           if (item.roomId !== sessionRef.current.roomId) {
-            toast({ tone: 'error', title: `${file.name} went to your previous room`, body: 'Please send it again.' });
+            toast({ tone: 'info', title: `${file.name} was sent to the room you just left`, body: 'Send it again to share it here too.' });
           } else onSent(item);
         })
         .catch((err) => {

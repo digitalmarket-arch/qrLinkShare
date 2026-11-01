@@ -1,0 +1,15 @@
+# One-click deploy on Render (https://render.com): New → Blueprint → pick this repo.
+services:
+  - type: web
+    name: qrlinkshare
+    runtime: node
+    region: singapore # closest Render region to India
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: SERVER_SECRET
+        generateValue: true

@@ -2,26 +2,40 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>qrLinkShare — Instant QR Code & Link Studio</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>qrLinkShare: send files between phone and computer</title>
     <meta
       name="description"
-      content="Precision QR code generator and shareable link workspace for URLs, Wi-Fi credentials, vCards, UTM campaign links, and printable QR sheets."
+      content="Send links, photos, PDFs, documents and notes between your phone and computer in real time. Pair with a QR code or 6-digit PIN, or sign in with Google or a Web3 wallet. No app needed."
     />
-    <meta property="og:title" content="qrLinkShare — Instant QR Code & Link Studio" />
+    <meta property="og:title" content="qrLinkShare: phone ⇄ computer, instantly" />
     <meta
       property="og:description"
-      content="Precision QR code generator and shareable link workspace for URLs, Wi-Fi credentials, vCards, UTM campaign links, and printable QR sheets."
+      content="Scan a QR code and send anything between your devices in real time. No app, no cable, no emailing yourself."
     />
     <meta property="og:type" content="website" />
+    <meta name="theme-color" content="#f5f5f1" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0b0b0f" media="(prefers-color-scheme: dark)" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234f3ff0'/%3E%3Cpath d='M8 8h7v7H8zM17 17h7v7h-7zM19 8h5v5h-5zM8 19h5v5H8z' fill='white'/%3E%3C/svg%3E"
+    />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Public+Sans:wght@400;500;600&display=swap"
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap"
       rel="stylesheet"
     />
+    <script>
+      // Apply the saved / system theme before first paint (avoids a white flash).
+      try {
+        var t = JSON.parse(localStorage.getItem('qrls.pref.theme') || '"system"');
+        var dark = t === 'dark' || (t === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
+        if (dark) document.documentElement.classList.add('dark');
+      } catch (e) {}
+    </script>
   </head>
-  <body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100 antialiased selection:bg-indigo-600 selection:text-white">
+  <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

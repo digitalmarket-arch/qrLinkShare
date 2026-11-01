@@ -1,80 +1,84 @@
-export type ShareCategory = 'link' | 'image' | 'document' | 'file' | 'text';
+/**
+ * Shared types used by both the browser app and the Node server.
+ */
 
-export type RetentionMode = 'temporary' | 'saved';
+export type DeviceType = 'desktop' | 'mobile' | 'tablet';
 
-export type DeviceType = 'desktop' | 'mobile';
+/** How a device got into a room. */
+export type AuthMethod = 'guest' | 'qr' | 'pin' | 'google' | 'wallet';
 
-export type DesktopAuthMethod = 'qr' | 'pin' | 'google';
+export type ItemKind = 'text' | 'link' | 'file';
 
-export type ErrorCorrectionLevel = 'L' | 'M' | 'Q' | 'H';
+/** A rough visual bucket for files, derived from the MIME type / extension. */
+export type FileKind =
+  | 'image'
+  | 'video'
+  | 'audio'
+  | 'pdf'
+  | 'doc'
+  | 'sheet'
+  | 'slides'
+  | 'archive'
+  | 'code'
+  | 'other';
+
+export interface DeviceInfo {
+  /** Stable random id stored in the browser (not a fingerprint). */
+  id: string;
+  name: string;
+  type: DeviceType;
+}
+
+export interface FileMeta {
+  /** Unguessable id used in the download URL (/api/files/:fileId). */
+  fileId: string;
+  name: string;
+  size: number;
+  mime: string;
+}
 
 export interface SharedItem {
   id: string;
   roomId: string;
-  category: ShareCategory;
-  /** 'temporary' for ephemeral one-time link/drop, 'saved' for persistent vault links/data/docs */
-  retentionMode: RetentionMode;
-  title: string;
-  /** For 'link', the destination URL. For 'text', the text body. For files/images/docs, optional note/caption. */
-  content: string;
-  /** Original filename for uploaded files, images, or documents */
-  fileName?: string;
-  /** MIME type e.g. image/png, application/pdf, text/markdown */
-  mimeType?: string;
-  /** Size in bytes */
-  sizeBytes: number;
-  /** Data URL (base64 or UTF-8 data URI) for instant preview & direct phone/desktop download */
-  dataUrl?: string;
-  /** Device that shared this item */
-  senderDevice: DeviceType;
-  senderName: string;
+  kind: ItemKind;
+  /** Body for 'text' items. */
+  text?: string;
+  /** Normalised http(s) URL for 'link' items. */
+  url?: string;
+  /** Present for 'file' items. */
+  file?: FileMeta;
+  from: DeviceInfo;
   createdAt: string;
-  pinned: boolean;
-  /** Tracks whether this item has been auto-opened or launched in the desktop browser */
-  openedOnDesktop?: boolean;
+  expiresAt: string;
 }
 
-export interface ConnectedDevice {
-  clientId: string;
-  deviceName: string;
-  deviceType: DeviceType;
+export interface PresentDevice extends DeviceInfo {
+  method: AuthMethod;
   joinedAt: string;
 }
 
-export interface CreateShareItemPayload {
-  id?: string;
-  category?: ShareCategory;
-  retentionMode?: RetentionMode;
-  title?: string;
-  content?: string;
-  fileName?: string;
-  mimeType?: string;
-  sizeBytes?: number;
-  dataUrl?: string;
-  senderDevice: DeviceType;
-  senderName: string;
+/** What the browser keeps in localStorage to rejoin its room. */
+export interface RoomSession {
+  roomId: string;
+  token: string;
+  method: AuthMethod;
+  /** Human label, e.g. an email or a shortened wallet address. */
+  account?: string;
 }
 
-export interface DesktopAuthSession {
-  authenticated: boolean;
-  method: DesktopAuthMethod;
-  userLabel: string;
-  userEmail?: string;
-  roomId: string;
-  authenticatedAt: string;
+export interface PairingCode {
+  pin: string;
+  /** Opaque token embedded in the QR code URL. */
+  pairToken: string;
+  expiresAt: string;
 }
 
-export interface QrLoginChallenge {
-  challengeId: string;
-  pinCode: string;
-  roomId: string;
-  status: 'pending' | 'approved';
-  approvedByName?: string;
-  createdAt: string;
-}
-
-export interface RoomState {
-  roomId: string;
-  items: SharedItem[];
-  devices: ConnectedDevice[];
-}
+/** Messages the server pushes over the WebSocket. */
+export type ServerEvent =
+  | { type: 'ready'; roomId: string; items: SharedItem[]; devices: PresentDevice[] }
+  | { type: 'presence'; devices: PresentDevice[] }
+  | { type: 'item:new'; item: SharedItem }
+  | { type: 'item:removed'; itemId: string }
+  | { type: 'room:cleared' }
+  | { type: 'pair:used'; by: DeviceInfo }
+  | { type: 'error'; message: string };

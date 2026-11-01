@@ -27,12 +27,15 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: 'npm'
 
       - name: Install dependencies
         run: npm install
 
       - name: Build static production bundle
+        env:
+          # Set this repo variable (Settings → Secrets and variables → Actions → Variables)
+          # to your deployed server, e.g. https://qrlinkshare.onrender.com
+          VITE_SERVER_URL: ${{ vars.VITE_SERVER_URL }}
         run: |
           npm run build
           cp dist/index.html dist/404.html

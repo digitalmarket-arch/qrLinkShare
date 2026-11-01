@@ -1,6 +1,0 @@
-{
-  "summary":  "Implementation plan for qrLinkShare QR-Code Desktop Login, 3-Way Authentication (QR Scan, Google Sign-In, 6-Digit PIN), Auto-Open Newest Link on Desktop, and Dual Retention Tiers (Temporary Drops vs. Saved Links/Data/Docs Vault) backed by Firebase Auth and Cloud Firestore.",
-  "updatedAt":  "2026-10-31T09:31:04.342948970Z",
-  "requestFeedback":  true,
-  "userFacing":  true
-}

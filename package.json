@@ -7,17 +7,23 @@
     "dev": "tsx server.ts",
     "build": "vite build",
     "start": "NODE_ENV=production tsx server.ts",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "tsx --test src/lib/shared.test.ts",
+    "check:api": "tsx scripts/api-check.ts"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.1.14",
     "express": "^4.21.2",
     "firebase": "^13.1.0",
+    "jose": "^6.2.14",
+    "jsqr": "^1.4.0",
     "lucide-react": "^0.546.0",
     "qrcode": "^1.5.4",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "tailwindcss": "^4.1.14",
+    "tsx": "^4.21.0",
+    "viem": "^2.57.14",
     "ws": "^8.18.0"
   },
   "devDependencies": {
@@ -28,8 +34,10 @@
     "@types/react-dom": "^19.0.0",
     "@types/ws": "^8.5.14",
     "@vitejs/plugin-react": "^5.0.4",
-    "tsx": "^4.21.0",
     "typescript": "~5.8.2",
     "vite": "^6.2.0"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }

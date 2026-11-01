@@ -1,27 +1,227 @@
 @import "tailwindcss";
 @custom-variant dark (&:where(.dark, .dark *));
 
+/*
+ * Design tokens. Every colour in the app comes from here, so re-branding
+ * means editing only this block.
+ */
+:root {
+  --bg: #f5f5f1;
+  --surface: #ffffff;
+  --surface-2: #f0efea;
+  --ink: #121216;
+  --muted: #6a6a74;
+  --line: #e3e2dc;
+  --brand: #4f3ff0;
+  --brand-ink: #ffffff;
+  --brand-soft: #ecebff;
+  --live: #12a150;
+  --warn: #c27803;
+  --danger: #d23b3b;
+  --ring: rgba(79, 63, 240, 0.35);
+  color-scheme: light;
+}
+
+.dark {
+  --bg: #0b0b0f;
+  --surface: #15151b;
+  --surface-2: #1d1d25;
+  --ink: #f1f1f4;
+  --muted: #9a9aa8;
+  --line: #2a2a34;
+  --brand: #8b80ff;
+  --brand-ink: #0b0b0f;
+  --brand-soft: #24214a;
+  --live: #34d27b;
+  --warn: #f2b13a;
+  --danger: #ff6b6b;
+  --ring: rgba(139, 128, 255, 0.45);
+  color-scheme: dark;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-brand: var(--brand);
+  --color-brand-ink: var(--brand-ink);
+  --color-brand-soft: var(--brand-soft);
+  --color-live: var(--live);
+  --color-warn: var(--warn);
+  --color-danger: var(--danger);
+  --font-sans: 'Plus Jakarta Sans', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
 @layer base {
-  :root {
-    --font-display: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
-    --font-sans: 'Public Sans', -apple-system, BlinkMacSystemFont, sans-serif;
-    --font-mono: 'JetBrains Mono', monospace;
+  html {
+    -webkit-tap-highlight-color: transparent;
   }
-
   body {
+    background: var(--bg);
+    color: var(--ink);
     font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
   }
-
-  h1, h2, h3, h4, .font-display {
-    font-family: var(--font-display);
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
   }
-
-  code, pre, .font-mono {
-    font-family: var(--font-mono);
-    font-variant-numeric: tabular-nums;
+  :focus-visible {
+    outline: 2px solid var(--brand);
+    outline-offset: 2px;
+  }
+  ::selection {
+    background: var(--brand);
+    color: var(--brand-ink);
   }
 }
 
-.tabular-nums {
-  font-variant-numeric: tabular-nums;
+@layer components {
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 1.25rem;
+  }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    min-height: 44px;
+    padding: 0 1rem;
+    border-radius: 0.875rem;
+    font-weight: 600;
+    font-size: 0.9rem;
+    cursor: pointer;
+    transition:
+      background-color 0.15s,
+      border-color 0.15s,
+      opacity 0.15s,
+      transform 0.05s;
+    white-space: nowrap;
+  }
+  .btn:active {
+    transform: scale(0.98);
+  }
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .btn-primary {
+    background: var(--brand);
+    color: var(--brand-ink);
+  }
+  .btn-primary:hover:not(:disabled) {
+    filter: brightness(1.08);
+  }
+  .btn-outline {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    color: var(--ink);
+  }
+  .btn-outline:hover:not(:disabled) {
+    background: var(--surface-2);
+  }
+  .btn-ghost {
+    color: var(--muted);
+  }
+  .btn-ghost:hover:not(:disabled) {
+    background: var(--surface-2);
+    color: var(--ink);
+  }
+  .icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+    border-radius: 0.75rem;
+    color: var(--muted);
+    cursor: pointer;
+    transition: background-color 0.15s, color 0.15s;
+  }
+  .icon-btn:hover {
+    background: var(--surface-2);
+    color: var(--ink);
+  }
+  .field {
+    width: 100%;
+    background: var(--surface-2);
+    border: 1px solid transparent;
+    border-radius: 0.875rem;
+    color: var(--ink);
+    transition: border-color 0.15s, box-shadow 0.15s, background-color 0.15s;
+  }
+  .field::placeholder {
+    color: var(--muted);
+  }
+  .field:focus {
+    outline: none;
+    background: var(--surface);
+    border-color: var(--brand);
+    box-shadow: 0 0 0 4px var(--ring);
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes pulse-ring {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--live) 60%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 8px transparent;
+  }
+}
+@keyframes flash {
+  from {
+    background: var(--brand-soft);
+  }
+  to {
+    background: var(--surface);
+  }
+}
+@keyframes scan {
+  0%,
+  100% {
+    top: 8%;
+  }
+  50% {
+    top: 88%;
+  }
+}
+
+.animate-rise {
+  animation: rise 0.25s ease-out both;
+}
+.animate-flash {
+  animation: flash 2.5s ease-out both;
+}
+.live-dot {
+  animation: pulse-ring 1.6s ease-out infinite;
+}
+.scan-line {
+  animation: scan 2.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
 }

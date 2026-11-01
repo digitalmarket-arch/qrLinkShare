@@ -9,6 +9,11 @@ import firebaseConfig from '../../firebase-applet-config.json';
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 
+/** Resolves once Firebase has finished its start-up checks (needed before the popup on Safari/iOS). */
+export function authReady(): Promise<void> {
+  return auth.authStateReady();
+}
+
 /** Opens the Google popup and returns a Firebase ID token for the server to verify. */
 export async function getGoogleIdToken(): Promise<string> {
   const provider = new GoogleAuthProvider();

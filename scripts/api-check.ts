@@ -5,6 +5,7 @@
  *   BASE=http://localhost:3000 npx tsx scripts/api-check.ts
  */
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
+import WebSocket from 'ws';
 
 const BASE = process.env.BASE || 'http://localhost:3000';
 const ORIGIN = new URL(BASE).origin;
@@ -48,10 +49,15 @@ async function main() {
   const forged = await post('/api/auth/wallet/verify', { message: ch3.data.message, signature: await attacker.signMessage({ message: ch3.data.message }) });
   check('signature from a different key rejected', forged.status === 401, forged.data.error);
 
-  // Message requested for another website (phishing relay)
+  // Another website asking for a sign-in message (phishing relay)
   const ch4 = await post('/api/auth/wallet/challenge', { address: account.address, chainId: 1 }, { Origin: 'https://evil.example' });
-  const phish = await post('/api/auth/wallet/verify', { message: ch4.data.message, signature: await account.signMessage({ message: ch4.data.message }) });
-  check('message created for another domain rejected here', phish.status === 401, phish.data.error);
+  check('other websites cannot get a sign-in message', ch4.status === 403, ch4.data.error);
+
+  // Edited message (e.g. statement swapped for "claim your airdrop") with the real nonce
+  const ch5 = await post('/api/auth/wallet/challenge', { address: account.address, chainId: 1 });
+  const edited = ch5.data.message.replace(/^Sign in to qrLinkShare.*$/m, 'Claim your free airdrop!');
+  const tamper = await post('/api/auth/wallet/verify', { message: edited, signature: await account.signMessage({ message: edited }) });
+  check('edited sign-in message rejected', tamper.status === 401, tamper.data.error);
 
   const bad = await post('/api/auth/wallet/challenge', { address: '0x123', chainId: 1 });
   check('invalid address rejected', bad.status === 400);
@@ -99,6 +105,46 @@ async function main() {
   const htmlRes = await fetch(`${BASE}/api/files/${html.file.fileId}`);
   check('HTML served as download with sandbox CSP', (htmlRes.headers.get('content-disposition') || '').startsWith('attachment') && (htmlRes.headers.get('content-security-policy') || '').includes('sandbox'));
   check('unknown file id → 404', (await fetch(`${BASE}/api/files/nope`)).status === 404);
+
+  /* --------------------------- pairing carry-over -------------------------- */
+  const desk = (await post('/api/rooms', {})).data;
+  const phone = (await post('/api/rooms', {})).data;
+  await post(`/api/rooms/${phone.roomId}/items`, { text: 'sent before pairing' }, auth(phone));
+  const deskCode = (await post(`/api/rooms/${desk.roomId}/pair`, {}, auth(desk))).data;
+  const joined = (await post('/api/pair/claim', { pin: deskCode.pin, fromToken: phone.token }, { 'X-Device-Id': 'phone-1' })).data;
+  const deskItems = await new Promise<any[]>((resolve) => {
+    const ws = new WebSocket(BASE.replace(/^http/, 'ws') + '/ws');
+    ws.on('open', () => ws.send(JSON.stringify({ type: 'hello', token: desk.token, device: { id: 'desk-1', name: 'Desk' } })));
+    ws.on('message', (raw) => {
+      const m = JSON.parse(raw.toString());
+      if (m.type === 'ready') {
+        ws.close();
+        resolve(m.items);
+      }
+    });
+  });
+  check('items sent before pairing move into the joined room', joined.roomId === desk.roomId && deskItems.some((i) => i.text === 'sent before pairing'));
+
+  /* ---------------------------- websocket safety --------------------------- */
+  const crash = async (frame: string) =>
+    new Promise<void>((resolve) => {
+      const ws = new WebSocket(BASE.replace(/^http/, 'ws') + '/ws');
+      ws.on('open', () => ws.send(frame));
+      ws.on('close', () => resolve());
+      ws.on('error', () => resolve());
+      setTimeout(() => {
+        ws.terminate();
+        resolve();
+      }, 500);
+    });
+  await crash('null');
+  await crash('[]');
+  await crash(JSON.stringify({ type: 'hello', token: a.token, device: { id: { toString: 1 }, name: { toString: 1 } } }));
+  const alive = await fetch(`${BASE}/api/health`).then((r) => r.ok).catch(() => false);
+  check('malformed WebSocket messages do not crash the server', alive);
+
+  const imgRes = await fetch(`${BASE}/api/files/${svg.file.fileId}`);
+  check('file responses allow cross-origin fetch (share from GitHub Pages)', imgRes.headers.get('access-control-allow-origin') === '*');
 
   /* ------------------------------ rate limiting ---------------------------- */
   let limited = false;

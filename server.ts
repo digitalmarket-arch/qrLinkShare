@@ -26,7 +26,13 @@ import { store } from './server/store';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*').split(',').map((s) => s.trim());
+const IS_PROD = process.env.NODE_ENV === 'production' || process.argv.includes('--prod');
+const list = (v: string | undefined) => (v || '').split(',').map((s) => s.trim()).filter(Boolean);
+const ALLOWED_ORIGINS = list(process.env.ALLOWED_ORIGINS || '*');
+/** This site's own public address(es), e.g. https://qrlinkshare.onrender.com */
+// Render sets RENDER_EXTERNAL_URL automatically.
+const PUBLIC_ORIGINS = list(process.env.PUBLIC_ORIGIN || process.env.RENDER_EXTERNAL_URL);
+const UPLOAD_BYTES_PER_HOUR = Number(process.env.UPLOAD_MB_PER_HOUR || 300) * 1024 * 1024;
 
 /* -------------------------------- helpers -------------------------------- */
 
@@ -65,11 +71,48 @@ function readDevice(req: Request): DeviceInfo {
   };
 }
 
-function originOf(req: Request): string {
+function selfOrigin(req: Request): string {
+  return `${req.protocol}://${req.headers.host}`;
+}
+
+/**
+ * The website a wallet sign-in message should name. Only this site's own origins
+ * qualify: the server itself, PUBLIC_ORIGIN, and explicit ALLOWED_ORIGINS entries
+ * (e.g. a GitHub Pages frontend). Returns null for any other website.
+ */
+function siteOriginFor(req: Request): string | null {
+  const self = selfOrigin(req);
+  const own = new Set([self, ...PUBLIC_ORIGINS, ...ALLOWED_ORIGINS.filter((o) => o !== '*')]);
   const origin = req.headers.origin;
-  if (origin && origin !== 'null') return origin;
-  const proto = (req.headers['x-forwarded-proto'] as string)?.split(',')[0] || req.protocol;
-  return `${proto}://${req.headers.host}`;
+  if (!origin || origin === 'null') return PUBLIC_ORIGINS[0] || self;
+  return own.has(origin) ? origin : null;
+}
+
+/**
+ * When a device that was alone in its own guest room joins another room, bring
+ * along what it already shared there, so a note sent before pairing isn't lost.
+ */
+function carryOver(fromToken: unknown, toRoomId: string, deviceId: string) {
+  const from = typeof fromToken === 'string' ? verifyToken(fromToken) : null;
+  if (!from || from.r === toRoomId || !from.r.startsWith('r_')) return;
+  const room = store.rooms.get(from.r);
+  if (!room || room.everShared) return;
+  if (store.presence(from.r).some((d) => d.id !== deviceId)) return;
+  store.moveItems(from.r, toRoomId);
+}
+
+/** Per-IP upload budget, so one client can't fill the whole server's memory. */
+const uploadUse = new Map<string, { bytes: number; resetAt: number }>();
+function uploadBudgetLeft(ip: string): number {
+  const rec = uploadUse.get(ip);
+  if (!rec || rec.resetAt < Date.now()) return UPLOAD_BYTES_PER_HOUR;
+  return UPLOAD_BYTES_PER_HOUR - rec.bytes;
+}
+function chargeUpload(ip: string, bytes: number) {
+  const now = Date.now();
+  const rec = uploadUse.get(ip);
+  if (!rec || rec.resetAt < now) uploadUse.set(ip, { bytes, resetAt: now + 60 * 60_000 });
+  else rec.bytes += bytes;
 }
 
 function session(roomId: string, method: AuthMethod, account?: string): RoomSession {
@@ -97,6 +140,7 @@ function rateLimit(bucket: string, max: number, windowMs: number) {
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of hits) if (v.resetAt < now) hits.delete(k);
+  for (const [k, v] of uploadUse) if (v.resetAt < now) uploadUse.delete(k);
 }, 60_000).unref();
 
 /* --------------------------------- app ---------------------------------- */
@@ -109,9 +153,10 @@ async function main() {
   // CORS, so the frontend can be hosted elsewhere (e.g. GitHub Pages) and call this API.
   app.use('/api', (req, res, next) => {
     const origin = req.headers.origin;
+    // Always vary on Origin, so a cached no-CORS response (e.g. an <img>) is never reused for fetch().
+    res.setHeader('Vary', 'Origin');
     if (origin && (ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin))) {
       res.setHeader('Access-Control-Allow-Origin', origin);
-      res.setHeader('Vary', 'Origin');
       res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
       res.setHeader(
         'Access-Control-Allow-Headers',
@@ -156,7 +201,8 @@ async function main() {
     const pairToken = typeof req.body?.pairToken === 'string' ? req.body.pairToken.slice(0, 64) : undefined;
     if (!pin && !pairToken) return void res.status(400).json({ error: 'Enter the 6-digit PIN shown on the other device.' });
 
-    const roomId = store.claimPairing(pin ? { pin } : { pairToken }, readDevice(req));
+    const device = readDevice(req);
+    const roomId = store.claimPairing(pin ? { pin } : { pairToken }, device);
     if (!roomId) {
       return void res.status(404).json({
         error: pin
@@ -164,6 +210,7 @@ async function main() {
           : 'This QR code has expired. Ask the other device to show a fresh one.',
       });
     }
+    carryOver(req.body?.fromToken, roomId, device.id);
     res.json(session(roomId, pin ? 'pin' : 'qr'));
   });
 
@@ -172,7 +219,9 @@ async function main() {
   app.post('/api/auth/google', json, rateLimit('auth', 30, 60_000), async (req, res) => {
     try {
       const user = await verifyGoogleIdToken(String(req.body?.idToken || ''));
-      res.json(session(accountRoomId('google', user.uid), 'google', user.email || 'Google account'));
+      const roomId = accountRoomId('google', user.uid);
+      carryOver(req.body?.fromToken, roomId, readDevice(req).id);
+      res.json(session(roomId, 'google', user.email || 'Google account'));
     } catch (err) {
       console.warn('[auth/google]', err instanceof Error ? err.message : err);
       res.status(401).json({ error: 'Google sign-in could not be verified. Please try again.' });
@@ -180,11 +229,15 @@ async function main() {
   });
 
   app.post('/api/auth/wallet/challenge', json, rateLimit('auth', 30, 60_000), (req, res) => {
+    const siteOrigin = siteOriginFor(req);
+    if (!siteOrigin) {
+      return void res.status(403).json({ error: 'Wallet sign-in is only available on the qrLinkShare website itself.' });
+    }
     try {
       const message = createWalletChallenge({
         address: String(req.body?.address || ''),
         chainId: Number(req.body?.chainId || 1),
-        origin: originOf(req),
+        siteOrigin,
       });
       res.json({ message });
     } catch {
@@ -197,9 +250,10 @@ async function main() {
       const address = await verifyWalletSignature({
         message: String(req.body?.message || ''),
         signature: String(req.body?.signature || ''),
-        origin: originOf(req),
       });
-      res.json(session(accountRoomId('wallet', address), 'wallet', shortAddress(address)));
+      const roomId = accountRoomId('wallet', address);
+      carryOver(req.body?.fromToken, roomId, readDevice(req).id);
+      res.json(session(roomId, 'wallet', shortAddress(address)));
     } catch (err) {
       res.status(401).json({ error: err instanceof Error ? err.message : 'Wallet sign-in failed.' });
     }
@@ -229,13 +283,23 @@ async function main() {
     '/api/rooms/:roomId/files',
     rateLimit('files', 60, 60_000),
     requireRoom,
+    (req, res, next) => {
+      const declared = Number(req.headers['content-length'] || 0);
+      if (declared > uploadBudgetLeft(req.ip || '')) {
+        return void res.status(429).json({ error: 'Upload limit reached for now. Please try again in an hour.' });
+      }
+      next();
+    },
     express.raw({ type: () => true, limit: MAX_FILE_BYTES }),
     (req: AuthedRequest, res) => {
       const data = req.body as Buffer;
       if (!Buffer.isBuffer(data) || data.length === 0) {
         return void res.status(400).json({ error: 'The file is empty.' });
       }
-      if (!store.hasSpaceFor(data.length)) return void res.status(413).json({ error: 'Room storage is full.' });
+      if (data.length > uploadBudgetLeft(req.ip || '')) {
+        return void res.status(429).json({ error: 'Upload limit reached for now. Please try again in an hour.' });
+      }
+      chargeUpload(req.ip || '', data.length);
       let name = 'file';
       try {
         name = safeFileName(decodeURIComponent(String(req.headers['x-file-name'] || 'file')));
@@ -285,6 +349,7 @@ async function main() {
     res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'");
     res.setHeader('Cache-Control', 'private, max-age=3600');
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('Access-Control-Allow-Origin', '*'); // public capability URL, no cookies involved
     res.send(file.data);
   });
 
@@ -301,7 +366,7 @@ async function main() {
 
   /* -------------------------------- web app ------------------------------- */
 
-  if (process.env.NODE_ENV !== 'production') {
+  if (!IS_PROD) {
     const { createServer } = await import('vite');
     const vite = await createServer({ server: { middlewareMode: true }, appType: 'spa' });
     app.use(vite.middlewares);
@@ -340,33 +405,42 @@ async function main() {
     const helloTimer = setTimeout(() => !conn.roomId && ws.close(4001, 'hello timeout'), 10_000);
 
     ws.on('message', (raw) => {
-      let msg: { type?: string; token?: string; device?: Partial<DeviceInfo> };
       try {
-        msg = JSON.parse(raw.toString());
-      } catch {
-        return;
-      }
-      if (msg.type === 'ping') return void ws.send('{"type":"pong"}');
-      if (msg.type !== 'hello' || conn.roomId) return;
+        let msg: unknown;
+        try {
+          msg = JSON.parse(raw.toString());
+        } catch {
+          return;
+        }
+        if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return;
+        const m = msg as { type?: unknown; token?: unknown; device?: unknown };
+        if (m.type === 'ping') return void ws.send('{"type":"pong"}');
+        if (m.type !== 'hello' || conn.roomId) return;
 
-      const claims = verifyToken(msg.token);
-      if (!claims) {
-        ws.send(JSON.stringify({ type: 'error', message: 'Session expired. Please pair again.' }));
-        return void ws.close(4003, 'unauthorized');
+        const claims = typeof m.token === 'string' ? verifyToken(m.token) : null;
+        if (!claims) {
+          ws.send(JSON.stringify({ type: 'error', message: 'Session expired. Please pair again.' }));
+          return void ws.close(4003, 'unauthorized');
+        }
+        clearTimeout(helloTimer);
+        const d = (m.device && typeof m.device === 'object' ? m.device : {}) as Record<string, unknown>;
+        const str = (v: unknown, fallback: string, max: number) => (typeof v === 'string' && v.trim() ? v.slice(0, max) : fallback);
+        const device: PresentDevice = {
+          id: str(d.id, conn.id, 64),
+          name: str(d.name, 'Unknown device', 60),
+          type: d.type === 'mobile' || d.type === 'tablet' ? d.type : 'desktop',
+          method: claims.m,
+          joinedAt: new Date().toISOString(),
+        };
+        conn.roomId = claims.r;
+        const room = store.room(claims.r);
+        ws.send(JSON.stringify({ type: 'ready', roomId: room.id, items: room.items, devices: store.presence(room.id) }));
+        store.join(room.id, conn.id, device);
+      } catch (err) {
+        // A malformed message must never take the whole server down.
+        console.error('[ws] message error', err);
+        ws.close(1011, 'error');
       }
-      clearTimeout(helloTimer);
-      const d = msg.device || {};
-      const device: PresentDevice = {
-        id: String(d.id || conn.id).slice(0, 64),
-        name: String(d.name || 'Unknown device').slice(0, 60),
-        type: d.type === 'mobile' || d.type === 'tablet' ? d.type : 'desktop',
-        method: claims.m,
-        joinedAt: new Date().toISOString(),
-      };
-      conn.roomId = claims.r;
-      const room = store.room(claims.r);
-      ws.send(JSON.stringify({ type: 'ready', roomId: room.id, items: room.items, devices: store.presence(room.id) }));
-      store.join(room.id, conn.id, device);
     });
 
     ws.on('close', () => {
@@ -392,5 +466,7 @@ async function main() {
     console.log(`qrLinkShare running on http://localhost:${PORT}`);
   });
 }
+
+process.on('unhandledRejection', (err) => console.error('[unhandledRejection]', err));
 
 main();

@@ -32,6 +32,29 @@ export function pairingLink(pairToken: string): string {
   return url.toString();
 }
 
+/* --------------------------------- helpers -------------------------------- */
+
+/** Random id that also works on plain-http LAN addresses (crypto.randomUUID needs https). */
+export function uid(): string {
+  if (typeof crypto.randomUUID === 'function' && isSecureContext) return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+/** Copy to clipboard, with a fallback for plain-http pages where navigator.clipboard is missing. */
+export async function copyText(text: string): Promise<void> {
+  if (navigator.clipboard && isSecureContext) return navigator.clipboard.writeText(text);
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');
+  ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;';
+  document.body.appendChild(ta);
+  ta.select();
+  const ok = document.execCommand('copy');
+  ta.remove();
+  if (!ok) throw new Error('Copy is not supported in this browser.');
+}
+
 /* ------------------------------ local storage ----------------------------- */
 
 function readJson<T>(key: string): T | null {
@@ -56,7 +79,7 @@ export function getDevice(): DeviceInfo {
   const saved = readJson<DeviceInfo>('qrls.device');
   const ua = navigator.userAgent;
   const device: DeviceInfo = {
-    id: saved?.id || crypto.randomUUID(),
+    id: saved?.id || uid(),
     name: saved?.name || deviceNameFromUA(ua),
     type: deviceTypeFromUA(ua),
   };
@@ -127,13 +150,16 @@ export const api = {
     request<Omit<RoomSession, 'token'>>('/api/session', { token }),
   createPairing: (s: RoomSession) =>
     postJson<PairingCode>(`/api/rooms/${encodeURIComponent(s.roomId)}/pair`, {}, s.token),
-  claimPin: (pin: string) => postJson<RoomSession>('/api/pair/claim', { pin }),
-  claimPairToken: (pairToken: string) => postJson<RoomSession>('/api/pair/claim', { pairToken }),
-  googleSignIn: (idToken: string) => postJson<RoomSession>('/api/auth/google', { idToken }),
+  // fromToken: this device's current room, so anything it already shared there comes along.
+  claimPin: (pin: string) => postJson<RoomSession>('/api/pair/claim', { pin, fromToken: loadSession()?.token }),
+  claimPairToken: (pairToken: string) =>
+    postJson<RoomSession>('/api/pair/claim', { pairToken, fromToken: loadSession()?.token }),
+  googleSignIn: (idToken: string) =>
+    postJson<RoomSession>('/api/auth/google', { idToken, fromToken: loadSession()?.token }),
   walletChallenge: (address: string, chainId: number) =>
     postJson<{ message: string }>('/api/auth/wallet/challenge', { address, chainId }),
   walletVerify: (message: string, signature: string) =>
-    postJson<RoomSession>('/api/auth/wallet/verify', { message, signature }),
+    postJson<RoomSession>('/api/auth/wallet/verify', { message, signature, fromToken: loadSession()?.token }),
   sendText: (s: RoomSession, text: string) =>
     postJson<{ item: SharedItem }>(`/api/rooms/${encodeURIComponent(s.roomId)}/items`, { text }, s.token),
   deleteItem: (s: RoomSession, itemId: string) =>

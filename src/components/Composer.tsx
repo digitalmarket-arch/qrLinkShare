@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 
 import { ArrowUp, Paperclip, UploadCloud, X } from 'lucide-react';
 import type { RoomSession, SharedItem } from '../types/share';
 import { MAX_FILE_BYTES, MAX_TEXT_CHARS, formatBytes, toHttpUrl } from '../lib/shared';
-import { api, uploadFile } from '../lib/api';
+import { api, uid, uploadFile } from '../lib/api';
 import { useToast } from './Toasts';
 
 interface Upload {
@@ -36,6 +36,13 @@ export function Composer({ session, peerCount, onSent }: Props) {
     e?.preventDefault();
     const value = text.trim();
     if (!value || sending) return;
+    if (value.length > MAX_TEXT_CHARS) {
+      // Very long notes travel as a .txt file instead of being cut off.
+      const stamp = new Date().toISOString().slice(0, 16).replace(/[T:]/g, '-');
+      addFiles([new File([text], `note-${stamp}.txt`, { type: 'text/plain' })]);
+      setText('');
+      return;
+    }
     setSending(true);
     try {
       const { item } = await api.sendText(session, value);
@@ -51,6 +58,8 @@ export function Composer({ session, peerCount, onSent }: Props) {
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     // Enter sends on computers; Shift+Enter makes a new line. On phones Enter is a new line.
+    // Never send while an input method (Japanese, Chinese, Hindi transliteration…) is composing.
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
     const coarse = matchMedia('(pointer: coarse)').matches;
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey || (!e.shiftKey && !coarse))) {
       e.preventDefault();
@@ -65,7 +74,7 @@ export function Composer({ session, peerCount, onSent }: Props) {
         continue;
       }
       if (file.size === 0) continue;
-      const key = crypto.randomUUID();
+      const key = uid();
       const { promise, cancel } = uploadFile(sessionRef.current, file, (p) =>
         setUploads((list) => list.map((u) => (u.key === key ? { ...u, progress: p } : u)))
       );
@@ -79,8 +88,12 @@ export function Composer({ session, peerCount, onSent }: Props) {
     }
   };
 
+  const addFilesRef = useRef(addFiles);
+  addFilesRef.current = addFiles;
+
   // Drop files anywhere on the page, or paste a screenshot with Ctrl/Cmd+V.
   useEffect(() => {
+    const addFiles = (files: FileList | File[]) => addFilesRef.current(files);
     let depth = 0;
     const hasFiles = (e: DragEvent) => Array.from(e.dataTransfer?.types || []).includes('Files');
     const enter = (e: DragEvent) => {
@@ -103,11 +116,20 @@ export function Composer({ session, peerCount, onSent }: Props) {
       if (e.dataTransfer?.files.length) addFiles(e.dataTransfer.files);
     };
     const paste = (e: ClipboardEvent) => {
-      const files = e.clipboardData?.files;
-      if (files && files.length > 0) {
-        e.preventDefault();
-        addFiles(files);
-      }
+      const dt = e.clipboardData;
+      const files = dt?.files;
+      if (!dt || !files || files.length === 0) return;
+      const t = e.target as HTMLElement | null;
+      const inTextField =
+        !!t && (t.tagName === 'TEXTAREA' || (t.tagName === 'INPUT' && (t as HTMLInputElement).type !== 'file') || t.isContentEditable);
+      // The PIN box is for digits only, never for uploading.
+      if (t?.getAttribute('aria-label') === '6-digit PIN') return;
+      // Excel/Word/Numbers copy text plus a picture of it: keep the text.
+      const hasText = dt.getData('text/plain').trim().length > 0;
+      const onlyImages = Array.from(files).every((f) => f.type.startsWith('image/'));
+      if (inTextField && hasText && onlyImages) return;
+      e.preventDefault();
+      addFiles(files);
     };
     window.addEventListener('dragenter', enter);
     window.addEventListener('dragover', over);
@@ -142,11 +164,10 @@ export function Composer({ session, peerCount, onSent }: Props) {
           ref={textRef}
           rows={2}
           value={text}
-          maxLength={MAX_TEXT_CHARS}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={onKeyDown}
           placeholder={peerCount > 0 ? 'Paste a link or type a note…' : 'Paste a link or type a note… (connect a device to send it across)'}
-          className="field resize-none px-4 py-3 text-[15px] leading-relaxed min-h-[72px]"
+          className="field resize-none px-4 py-3 text-base leading-relaxed min-h-[72px]"
         />
         <div className="mt-3 flex items-center gap-2">
           <button type="button" className="btn btn-outline" onClick={() => fileInput.current?.click()}>
@@ -164,7 +185,9 @@ export function Composer({ session, peerCount, onSent }: Props) {
             }}
           />
           <p className="hidden sm:block text-xs text-muted flex-1 truncate">
-            Photos, PDFs, docs, any file up to {formatBytes(MAX_FILE_BYTES)}. Drop or paste anywhere.
+            {text.length > MAX_TEXT_CHARS
+              ? 'Long note: it will be sent as a .txt file.'
+              : `Photos, PDFs, docs, any file up to ${formatBytes(MAX_FILE_BYTES)}. Drop or paste anywhere.`}
           </p>
           <span className="sm:hidden flex-1" />
           <button type="submit" className="btn btn-primary" disabled={!text.trim() || sending}>

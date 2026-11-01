@@ -60,9 +60,15 @@ Real-time sharing needs the Node server running somewhere. **GitHub Pages alone 
 2. It builds and starts automatically, in the Singapore region (closest to India), with a random `SERVER_SECRET`.
 3. Open the `.onrender.com` URL. Done.
 
-Caveat: Render's free plan sleeps after 15 minutes without visitors, so the first visit takes about 30 seconds. Because files are kept in memory, a sleep or restart also clears shared items. A paid plan (about $7/month) avoids this. Any Node host that supports WebSockets works the same way (Railway, Fly.io, a VPS).
+Caveats of the free plan:
+- It sleeps after 15 minutes without visitors, so the first visit takes about 30 seconds. Because files are kept in memory, a sleep or restart also clears shared items.
+- It has 512 MB of RAM, so `render.yaml` caps stored files at 150 MB in total (`MAX_STORE_MB`). Keep that well below the RAM size or the server will crash when it fills up.
 
-**Optional: frontend on GitHub Pages + server on Render.** Set the repository variable `VITE_SERVER_URL` (Settings → Secrets and variables → Actions → Variables) to your server URL, e.g. `https://qrlinkshare.onrender.com`. The included workflow then publishes the page on every push to `main`.
+A paid plan (about $7/month) removes both limits. If you upgrade, you can raise `MAX_STORE_MB`. Any Node host that supports WebSockets works the same way (Railway, Fly.io, a VPS).
+
+**Optional: frontend on GitHub Pages + server on Render.**
+1. In GitHub, set the repository variable `VITE_SERVER_URL` (Settings → Secrets and variables → Actions → Variables) to your server URL, e.g. `https://qrlinkshare.onrender.com`. The included workflow then publishes the page on every push to `main`. It does nothing until this variable is set.
+2. On the server (Render → Environment), set `ALLOWED_ORIGINS` to your Pages address, e.g. `https://yourname.github.io`. Wallet sign-in only works on websites listed there.
 
 ### Google sign-in setup
 
@@ -79,11 +85,16 @@ There's nothing to set up. It uses the standard browser wallet API (EIP-1193 / E
 
 ## Environment variables
 
-See `.env.example`. The important one is **`SERVER_SECRET`**. Without it, a random secret is used and every device has to pair again after a restart.
+See `.env.example`. The important ones:
+
+- **`SERVER_SECRET`**: without it, a random secret is used and every device has to pair again after a restart.
+- **`PUBLIC_ORIGIN`**: your site's address, e.g. `https://share.example.com`. It's used in wallet sign-in messages and is detected automatically on Render.
+- **`MAX_STORE_MB`** / **`MAX_ROOM_MB`** / **`UPLOAD_MB_PER_HOUR`**: memory limits for shared files.
 
 ## Privacy & security, in plain words
 
 - Each room is private. A device can only join with a fresh one-time QR/PIN (valid 3 minutes), or by signing in to the same account. PIN guessing is rate-limited.
+- Wallet sign-in messages always name this website, and the server only accepts the exact message it issued. A different website can't reuse them to get into your wallet's room.
 - Files and notes are stored **on the server, in memory, for 24 hours** and are then deleted. They are encrypted in transit (https) but **not end-to-end encrypted**: whoever runs the server could technically read them. Don't use it for passwords or highly sensitive documents.
 - File download links contain a long random key. Anyone who has the link (or scans an item's QR code) can download that file until it expires.
 - Uploaded files can never run code on the site: risky types (HTML, SVG…) are always downloaded, never displayed.

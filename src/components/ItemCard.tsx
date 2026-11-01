@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Archive,
   Copy,
@@ -22,7 +22,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import type { FileKind, SharedItem } from '../types/share';
-import { fileKindOf, formatBytes, timeAgo } from '../lib/shared';
+import { fileKindOf, formatBytes, isInlineSafeMime, timeAgo } from '../lib/shared';
 import { fileUrl } from '../lib/api';
 
 const FILE_ICONS: Record<FileKind, typeof File> = {
@@ -56,7 +56,8 @@ export function ItemCard({ item, myDeviceId, fresh, onCopy, onShowQr, onDelete }
 
   const kind = item.file ? fileKindOf(item.file.mime, item.file.name) : null;
   const isImage = kind === 'image' && item.file && /^image\/(png|jpeg|gif|webp|avif|bmp)$/i.test(item.file.mime);
-  const canPreview = item.file && (isImage || kind === 'pdf' || kind === 'video' || kind === 'audio' || item.file.mime === 'text/plain');
+  // Only offer Preview when the server will actually show it in the browser (not .mov / .m4a etc.).
+  const canPreview = !!item.file && isInlineSafeMime(item.file.mime);
   const longText = (item.text?.length ?? 0) > 280 || (item.text?.split('\n').length ?? 0) > 6;
 
   let Icon = StickyNote;
@@ -73,20 +74,35 @@ export function ItemCard({ item, myDeviceId, fresh, onCopy, onShowQr, onDelete }
   }
 
   const canNativeShare = typeof navigator !== 'undefined' && 'share' in navigator && matchMedia('(pointer: coarse)').matches;
-  const nativeShare = async () => {
-    try {
-      if (item.file) {
-        const res = await fetch(fileUrl(item.file.fileId));
-        const blob = await res.blob();
-        const f = new window.File([blob], item.file.name, { type: item.file.mime });
-        if (navigator.canShare?.({ files: [f] })) return await navigator.share({ files: [f] });
-        return await navigator.share({ url: fileUrl(item.file.fileId) });
-      }
-      if (item.url) return await navigator.share({ url: item.url });
-      if (item.text) return await navigator.share({ text: item.text });
-    } catch {
-      // user cancelled
-    }
+
+  // Browsers only open the share sheet straight from a tap, so the file must already be
+  // downloaded by then. Small files are fetched in the background ahead of time.
+  const shareFile = useRef<File | null>(null);
+  useEffect(() => {
+    const meta = item.file;
+    if (!canNativeShare || !meta || meta.size > 10 * 1024 * 1024) return;
+    let alive = true;
+    fetch(fileUrl(meta.fileId))
+      .then((r) => (r.ok ? r.blob() : Promise.reject()))
+      .then((blob) => {
+        if (alive) shareFile.current = new window.File([blob], meta.name, { type: meta.mime });
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [item.file?.fileId, canNativeShare]);
+
+  const nativeShare = () => {
+    let p: Promise<void>;
+    if (item.file) {
+      const f = shareFile.current;
+      p = f && navigator.canShare?.({ files: [f] })
+        ? navigator.share({ files: [f], title: item.file.name })
+        : navigator.share({ url: fileUrl(item.file.fileId), title: item.file.name });
+    } else if (item.url) p = navigator.share({ url: item.url });
+    else p = navigator.share({ text: item.text ?? '' });
+    p.catch(() => {}); // cancelled
   };
 
   return (
@@ -100,7 +116,13 @@ export function ItemCard({ item, myDeviceId, fresh, onCopy, onShowQr, onDelete }
             rel="noreferrer"
             className="shrink-0 w-16 h-16 sm:w-20 sm:h-20 rounded-xl overflow-hidden bg-surface-2"
           >
-            <img src={fileUrl(item.file!.fileId)} alt={item.file!.name} loading="lazy" className="w-full h-full object-cover" />
+            <img
+              src={fileUrl(item.file!.fileId)}
+              alt={item.file!.name}
+              loading="lazy"
+              crossOrigin="anonymous"
+              className="w-full h-full object-cover"
+            />
           </a>
         ) : (
           <div

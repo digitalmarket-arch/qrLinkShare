@@ -2,7 +2,7 @@ import { lazy, Suspense, useEffect, useState } from 'react';
 import { ChevronDown, Copy, KeyRound, QrCode as QrIcon, RefreshCw, ScanLine, Wallet } from 'lucide-react';
 import type { RoomSession } from '../types/share';
 import { formatPin } from '../lib/shared';
-import { pairingLink } from '../lib/api';
+import { copyText, pairingLink } from '../lib/api';
 import { usePairing } from '../hooks/usePairing';
 import { QrCode } from './QrCode';
 import { PinInput } from './PinInput';
@@ -141,8 +141,7 @@ export function ConnectPanel(props: Props) {
                             aria-label="Copy pairing link"
                             disabled={!link}
                             onClick={() =>
-                              navigator.clipboard
-                                .writeText(link)
+                              copyText(link)
                                 .then(() => toast({ tone: 'success', title: 'Pairing link copied', body: 'Open it on the other device within 3 minutes.' }))
                                 .catch(() => {})
                             }

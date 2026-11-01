@@ -29,25 +29,26 @@ export async function verifyGoogleIdToken(idToken: string): Promise<{ uid: strin
 /* ------------------------------ Web3 wallets ------------------------------ */
 
 const NONCE_TTL_MS = 5 * 60 * 1000;
-const walletNonces = new Map<string, { address: string; expiresAt: number }>();
+/** nonce -> the exact message we issued. Signatures are only accepted for that exact text. */
+const walletNonces = new Map<string, { message: string; expiresAt: number }>();
 
 setInterval(() => {
   const now = Date.now();
   for (const [nonce, rec] of walletNonces) if (rec.expiresAt < now) walletNonces.delete(nonce);
 }, 60_000).unref();
 
-/** Creates the sign-in message the wallet will be asked to sign. */
-export function createWalletChallenge(params: {
-  address: string;
-  chainId: number;
-  origin: string;
-}): string {
+/**
+ * Creates the sign-in message the wallet will be asked to sign.
+ * `siteOrigin` must be one of THIS site's own origins (chosen by the server, never
+ * copied blindly from the request), so a phishing site can't obtain a message that
+ * names itself; the wallet would warn that the domain doesn't match.
+ */
+export function createWalletChallenge(params: { address: string; chainId: number; siteOrigin: string }): string {
   const address = getAddress(params.address); // throws on invalid, returns EIP-55 checksum form
-  const originUrl = new URL(params.origin);
+  const originUrl = new URL(params.siteOrigin);
   const nonce = randomId(12).replace(/[^a-zA-Z0-9]/g, '');
   const now = Date.now();
-  walletNonces.set(nonce, { address: address.toLowerCase(), expiresAt: now + NONCE_TTL_MS });
-  return buildWalletMessage({
+  const message = buildWalletMessage({
     domain: originUrl.host,
     uri: originUrl.origin,
     address,
@@ -56,6 +57,8 @@ export function createWalletChallenge(params: {
     issuedAt: new Date(now).toISOString(),
     expiresAt: new Date(now + NONCE_TTL_MS).toISOString(),
   });
+  walletNonces.set(nonce, { message, expiresAt: now + NONCE_TTL_MS });
+  return message;
 }
 
 const CHAINS: Record<number, Chain> = {
@@ -67,21 +70,15 @@ const CHAINS: Record<number, Chain> = {
 };
 
 /** Verifies a signed wallet message. Returns the checksummed address. */
-export async function verifyWalletSignature(params: {
-  message: string;
-  signature: string;
-  origin: string;
-}): Promise<string> {
+export async function verifyWalletSignature(params: { message: string; signature: string }): Promise<string> {
   const parsed = parseWalletMessage(params.message);
   if (!parsed) throw new Error('Malformed sign-in message.');
 
-  const nonceRec = walletNonces.get(parsed.nonce);
-  if (!nonceRec || nonceRec.expiresAt < Date.now()) throw new Error('Sign-in request expired. Please try again.');
-  if (nonceRec.address !== parsed.address.toLowerCase()) throw new Error('Address does not match the sign-in request.');
-  if (new URL(params.origin).host !== parsed.domain) throw new Error('Sign-in message was created for another website.');
-
+  const issued = walletNonces.get(parsed.nonce);
+  if (!issued || issued.expiresAt < Date.now()) throw new Error('Sign-in request expired. Please try again.');
   // One-time use, even if verification fails below.
   walletNonces.delete(parsed.nonce);
+  if (issued.message !== params.message) throw new Error('Signed message does not match the sign-in request.');
 
   const address = getAddress(parsed.address);
   const signature = params.signature as `0x${string}`;

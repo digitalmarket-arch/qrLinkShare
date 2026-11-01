@@ -18,6 +18,8 @@ concurrency:
 
 jobs:
   build:
+    # The page is useless without a server, so only publish once VITE_SERVER_URL is set.
+    if: ${{ vars.VITE_SERVER_URL != '' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

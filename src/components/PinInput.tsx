@@ -50,7 +50,6 @@ export function PinInput({ disabled, onComplete }: Props) {
         inputMode="numeric"
         autoComplete="one-time-code"
         pattern="[0-9]*"
-        maxLength={6}
         aria-label="6-digit PIN"
         className="absolute inset-0 w-full h-full opacity-0 cursor-text"
       />

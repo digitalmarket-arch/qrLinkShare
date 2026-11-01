@@ -16,9 +16,9 @@ import { randomId, randomPin } from './tokens';
 
 const HOUR = 60 * 60 * 1000;
 export const ITEM_TTL_MS = Number(process.env.ITEM_TTL_HOURS || 24) * HOUR;
-const PAIR_TTL_MS = 3 * 60 * 1000;
+export const PAIR_TTL_MS = 3 * 60 * 1000;
 const MAX_ITEMS_PER_ROOM = 200;
-const MAX_ROOM_BYTES = Number(process.env.MAX_ROOM_MB || 200) * 1024 * 1024;
+export const MAX_ROOM_BYTES = Number(process.env.MAX_ROOM_MB || 200) * 1024 * 1024;
 const MAX_TOTAL_BYTES = Number(process.env.MAX_STORE_MB || 512) * 1024 * 1024;
 
 export interface StoredFile {
@@ -35,15 +35,27 @@ export interface Room {
   devices: Map<string, PresentDevice>; // keyed by connection id
   pairing?: PairingCode;
   bytes: number;
+  /** Another device has joined this room at some point (so never move its items away). */
+  everShared?: boolean;
+}
+
+/** A PIN record and its QR-token twin point at each other, so using one always revokes both. */
+interface PairRecord {
+  roomId: string;
+  expiresAt: number;
+  pin: string;
+  pairToken: string;
 }
 
 type Listener = (roomId: string, event: Record<string, unknown>) => void;
 
+const byNewest = (a: SharedItem, b: SharedItem) => b.createdAt.localeCompare(a.createdAt);
+
 class Store {
   rooms = new Map<string, Room>();
   files = new Map<string, StoredFile>();
-  pins = new Map<string, { roomId: string; expiresAt: number }>();
-  pairTokens = new Map<string, { roomId: string; expiresAt: number }>();
+  pins = new Map<string, PairRecord>();
+  pairTokens = new Map<string, PairRecord>();
   totalBytes = 0;
   private listener: Listener = () => {};
 
@@ -121,6 +133,35 @@ class Store {
     this.emit(roomId, { type: 'room:cleared' });
   }
 
+  /**
+   * Moves everything a device shared in its old (solo) room into the room it just
+   * joined, so a note sent before pairing isn't lost. Only call this when nobody
+   * else is in the old room.
+   */
+  moveItems(fromRoomId: string, toRoomId: string) {
+    const from = this.rooms.get(fromRoomId);
+    if (!from || fromRoomId === toRoomId || from.items.length === 0) return;
+    const to = this.room(toRoomId);
+    const moving = [...from.items].reverse(); // oldest first
+    from.items = [];
+    for (const item of moving) {
+      item.roomId = toRoomId;
+      if (item.file) {
+        const f = this.files.get(item.file.fileId);
+        if (f) {
+          f.roomId = toRoomId;
+          from.bytes -= f.data.length;
+          to.bytes += f.data.length;
+        }
+      }
+      to.items.push(item);
+      this.emit(toRoomId, { type: 'item:new', item });
+    }
+    to.items.sort(byNewest);
+    this.emit(fromRoomId, { type: 'room:cleared' });
+    this.enforceLimits(to);
+  }
+
   private dropFile(fileId: string, room?: Room) {
     const f = this.files.get(fileId);
     if (!f) return;
@@ -130,11 +171,6 @@ class Store {
     if (r) r.bytes -= f.data.length;
   }
 
-  /** Can this room accept `size` more bytes? */
-  hasSpaceFor(size: number): boolean {
-    return size <= MAX_ROOM_BYTES;
-  }
-
   private enforceLimits(room: Room) {
     // Oldest items go first when a room is too big or has too many items.
     while (room.items.length > MAX_ITEMS_PER_ROOM || room.bytes > MAX_ROOM_BYTES) {
@@ -142,12 +178,14 @@ class Store {
       if (!oldest) break;
       this.removeItem(room.id, oldest.id);
     }
-    // Server-wide cap: evict the oldest file anywhere.
-    while (this.totalBytes > MAX_TOTAL_BYTES && this.files.size > 0) {
-      let oldest: StoredFile | undefined;
-      for (const f of this.files.values()) if (!oldest || f.expiresAt < oldest.expiresAt) oldest = f;
-      if (!oldest) break;
-      this.removeItem(oldest.roomId, oldest.itemId);
+    // Server-wide cap: trim the room holding the most data (normally whoever is
+    // flooding the server), never someone else's small room first.
+    while (this.totalBytes > MAX_TOTAL_BYTES) {
+      let heaviest: Room | undefined;
+      for (const r of this.rooms.values()) if (r.bytes > 0 && (!heaviest || r.bytes > heaviest.bytes)) heaviest = r;
+      const victim = heaviest && [...heaviest.items].reverse().find((i) => i.file);
+      if (!heaviest || !victim) break;
+      this.removeItem(heaviest.id, victim.id);
     }
   }
 
@@ -156,31 +194,33 @@ class Store {
   /** Creates a fresh one-time PIN + QR token for a room (replacing the old one). */
   createPairing(roomId: string): PairingCode {
     const room = this.room(roomId);
-    this.revokePairing(room);
+    if (room.pairing) this.revoke(room.pairing.pin, room.pairing.pairToken);
+    room.pairing = undefined;
     let pin = '';
     do pin = randomPin();
     while (this.pins.has(pin));
     const pairToken = randomId(18);
     const expiresAt = Date.now() + PAIR_TTL_MS;
-    this.pins.set(pin, { roomId, expiresAt });
-    this.pairTokens.set(pairToken, { roomId, expiresAt });
+    const rec: PairRecord = { roomId, expiresAt, pin, pairToken };
+    this.pins.set(pin, rec);
+    this.pairTokens.set(pairToken, rec);
     room.pairing = { pin, pairToken, expiresAt: new Date(expiresAt).toISOString() };
     return room.pairing;
   }
 
-  private revokePairing(room: Room) {
-    if (!room.pairing) return;
-    this.pins.delete(room.pairing.pin);
-    this.pairTokens.delete(room.pairing.pairToken);
-    room.pairing = undefined;
+  private revoke(pin: string, pairToken: string) {
+    this.pins.delete(pin);
+    this.pairTokens.delete(pairToken);
   }
 
   /** Uses up a PIN or QR token. Returns the room id, or null if invalid/expired. */
   claimPairing(by: { pin?: string; pairToken?: string }, device: DeviceInfo): string | null {
     const rec = by.pin ? this.pins.get(by.pin) : by.pairToken ? this.pairTokens.get(by.pairToken) : undefined;
     if (!rec || rec.expiresAt < Date.now()) return null;
+    this.revoke(rec.pin, rec.pairToken);
     const room = this.room(rec.roomId);
-    this.revokePairing(room);
+    if (room.pairing?.pin === rec.pin) room.pairing = undefined;
+    room.everShared = true;
     this.emit(room.id, { type: 'pair:used', by: device });
     return room.id;
   }
@@ -219,8 +259,13 @@ class Store {
     for (const room of this.rooms.values()) {
       const expired = room.items.filter((i) => new Date(i.expiresAt).getTime() < now);
       for (const item of expired) this.removeItem(room.id, item.id);
-      if (room.pairing && new Date(room.pairing.expiresAt).getTime() < now) this.revokePairing(room);
-      if (room.items.length === 0 && room.devices.size === 0) this.rooms.delete(room.id);
+      if (room.pairing && new Date(room.pairing.expiresAt).getTime() < now) {
+        this.revoke(room.pairing.pin, room.pairing.pairToken);
+        room.pairing = undefined;
+      }
+      // Keep rooms that still have a live pairing code, otherwise the code's
+      // one-time revoke would have nothing to point at.
+      if (room.items.length === 0 && room.devices.size === 0 && !room.pairing) this.rooms.delete(room.id);
     }
     for (const [pin, rec] of this.pins) if (rec.expiresAt < now) this.pins.delete(pin);
     for (const [t, rec] of this.pairTokens) if (rec.expiresAt < now) this.pairTokens.delete(t);

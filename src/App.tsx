@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Loader2, RefreshCw, ServerCrash } from 'lucide-react';
 import type { DeviceInfo, RoomSession, SharedItem } from './types/share';
-import { ApiError, api, getDevice, loadPref, loadSession, saveSession, savePref } from './lib/api';
+import { ApiError, api, copyText, getDevice, loadPref, loadSession, saveSession, savePref } from './lib/api';
 import { signInWithWallet, walletErrorMessage, type WalletOption } from './lib/wallet';
 import { useRoom } from './hooks/useRoom';
 import { ToastProvider, useToast } from './components/Toasts';
@@ -12,6 +12,19 @@ import { Composer } from './components/Composer';
 import { Feed } from './components/Feed';
 import { ItemQrModal } from './components/ItemQrModal';
 import { WalletModal } from './components/WalletModal';
+
+type FirebaseModule = typeof import('./lib/firebase');
+let firebasePromise: Promise<FirebaseModule> | null = null;
+const loadFirebase = () => (firebasePromise ??= import('./lib/firebase'));
+
+/** Opens a link in a new tab without giving it access to this page. Returns false if blocked. */
+function openInNewTab(url: string): boolean {
+  const win = window.open('about:blank', '_blank');
+  if (!win) return false;
+  win.opener = null;
+  win.location.href = url;
+  return true;
+}
 
 export default function App() {
   return (
@@ -49,6 +62,7 @@ function Shell() {
   const [pairSignal, setPairSignal] = useState(0);
   const [freshIds, setFreshIds] = useState<Set<string>>(new Set());
   const [autoOpen, setAutoOpen] = useState(() => loadPref('autoOpen', false));
+  const firebaseRef = useRef<FirebaseModule | null>(null);
   const autoOpenRef = useRef(autoOpen);
   autoOpenRef.current = autoOpen;
   const unread = useRef(0);
@@ -105,6 +119,22 @@ function Shell() {
     runBoot();
   }, []);
 
+  // Load Google sign-in ahead of time. Safari/iOS only allow the sign-in popup if it
+  // opens right after the tap, with no downloading in between.
+  useEffect(() => {
+    if (boot !== 'ready' || session?.method === 'google') return;
+    const start = () =>
+      loadFirebase()
+        .then(async (m) => {
+          await m.authReady();
+          firebaseRef.current = m;
+        })
+        .catch(() => {});
+    const idle = (window as unknown as { requestIdleCallback?: (cb: () => void) => void }).requestIdleCallback;
+    if (idle) idle(start);
+    else setTimeout(start, 1500);
+  }, [boot, session?.method]);
+
   /* ------------------------------- real time -------------------------------- */
 
   const onNewItem = useCallback(
@@ -123,15 +153,12 @@ function Shell() {
       }
 
       const what = item.kind === 'link' ? 'link' : item.kind === 'file' ? 'file' : 'note';
-      if (item.kind === 'link' && autoOpenRef.current) {
-        const win = window.open(item.url, '_blank', 'noopener,noreferrer');
-        if (win !== null) return;
-      }
+      if (item.kind === 'link' && autoOpenRef.current && openInNewTab(item.url!)) return;
       toast({
         tone: 'info',
         title: `New ${what} from ${item.from.name}`,
         body: item.kind === 'link' ? item.url : item.kind === 'file' ? item.file?.name : item.text?.slice(0, 120),
-        action: item.kind === 'link' ? { label: 'Open', onClick: () => window.open(item.url, '_blank', 'noopener,noreferrer') } : undefined,
+        action: item.kind === 'link' ? { label: 'Open', onClick: () => openInNewTab(item.url!) } : undefined,
       });
     },
     [toast]
@@ -207,8 +234,9 @@ function Shell() {
   const signInGoogle = async () => {
     setBusy(true);
     try {
-      const { getGoogleIdToken } = await import('./lib/firebase');
-      const idToken = await getGoogleIdToken();
+      // Normally already loaded (see the preload above), so the popup opens straight from the tap.
+      const fb = firebaseRef.current ?? (await loadFirebase());
+      const idToken = await fb.getGoogleIdToken();
       const s = await api.googleSignIn(idToken);
       adopt(s);
       toast({ tone: 'success', title: `Signed in as ${s.account}`, body: 'Sign in with the same Google account on your other device.' });
@@ -242,18 +270,14 @@ function Shell() {
   };
 
   const leave = async () => {
-    if (session?.method === 'google') {
-      const { signOutGoogle } = await import('./lib/firebase');
-      await signOutGoogle();
-    }
+    if (session?.method === 'google') await (await loadFirebase()).signOutGoogle();
     saveSession(null);
     await startFreshRoom();
     toast({ tone: 'info', title: session?.method === 'google' || session?.method === 'wallet' ? 'Signed out' : 'Left the room', body: 'This device is now in a new, empty room.' });
   };
 
   const copy = (text: string, what: string) => {
-    navigator.clipboard
-      .writeText(text)
+    copyText(text)
       .then(() => toast({ tone: 'success', title: `${what} copied` }, 2000))
       .catch(() => toast({ tone: 'error', title: 'Copy failed', body: 'Your browser blocked clipboard access.' }));
   };

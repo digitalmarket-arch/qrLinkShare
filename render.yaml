@@ -4,12 +4,19 @@ services:
     name: qrlinkshare
     runtime: node
     region: singapore # closest Render region to India
-    plan: free
+    plan: free # 512 MB RAM. Keep the storage caps below well under that.
     buildCommand: npm install && npm run build
-    startCommand: npm start
+    startCommand: node --import tsx server.ts --prod
     healthCheckPath: /api/health
     envVars:
       - key: NODE_VERSION
         value: "22"
       - key: SERVER_SECRET
         generateValue: true
+      # Shared files live in RAM. On the free plan keep the total around 150 MB.
+      - key: MAX_STORE_MB
+        value: "150"
+      - key: MAX_ROOM_MB
+        value: "100"
+      - key: UPLOAD_MB_PER_HOUR
+        value: "150"

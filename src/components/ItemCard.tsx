@@ -75,31 +75,41 @@ export function ItemCard({ item, myDeviceId, fresh, onCopy, onShowQr, onDelete }
 
   const canNativeShare = typeof navigator !== 'undefined' && 'share' in navigator && matchMedia('(pointer: coarse)').matches;
 
-  // Browsers only open the share sheet straight from a tap, so the file must already be
-  // downloaded by then. Small files are fetched in the background ahead of time.
+  // Browsers only open the share sheet straight from a tap, so a file must already be
+  // downloaded by then. We start downloading when the finger touches Share (never in
+  // the background); if it isn't ready by the tap, the button asks for a second tap.
+  const SHARE_FILE_MAX = 10 * 1024 * 1024;
   const shareFile = useRef<File | null>(null);
-  useEffect(() => {
+  const [shareState, setShareState] = useState<'idle' | 'loading' | 'ready'>('idle');
+  useEffect(
+    () => () => {
+      shareFile.current = null; // release memory when the card goes away
+    },
+    []
+  );
+
+  const prepareShare = () => {
     const meta = item.file;
-    if (!canNativeShare || !meta || meta.size > 10 * 1024 * 1024) return;
-    let alive = true;
+    if (!meta || meta.size > SHARE_FILE_MAX || shareState !== 'idle') return;
+    setShareState('loading');
     fetch(fileUrl(meta.fileId))
       .then((r) => (r.ok ? r.blob() : Promise.reject()))
       .then((blob) => {
-        if (alive) shareFile.current = new window.File([blob], meta.name, { type: meta.mime });
+        shareFile.current = new window.File([blob], meta.name, { type: meta.mime });
+        setShareState('ready');
       })
-      .catch(() => {});
-    return () => {
-      alive = false;
-    };
-  }, [item.file?.fileId, canNativeShare]);
+      .catch(() => setShareState('idle'));
+  };
 
   const nativeShare = () => {
     let p: Promise<void>;
     if (item.file) {
       const f = shareFile.current;
-      p = f && navigator.canShare?.({ files: [f] })
-        ? navigator.share({ files: [f], title: item.file.name })
-        : navigator.share({ url: fileUrl(item.file.fileId), title: item.file.name });
+      if (f && navigator.canShare?.({ files: [f] })) p = navigator.share({ files: [f], title: item.file.name });
+      else if (item.file.size <= SHARE_FILE_MAX && shareState !== 'ready') {
+        prepareShare(); // still downloading: the button shows "tap again"
+        return;
+      } else p = navigator.share({ url: fileUrl(item.file.fileId), title: item.file.name });
     } else if (item.url) p = navigator.share({ url: item.url });
     else p = navigator.share({ text: item.text ?? '' });
     p.catch(() => {}); // cancelled
@@ -197,8 +207,15 @@ export function ItemCard({ item, myDeviceId, fresh, onCopy, onShowQr, onDelete }
         <span className="flex-1" />
 
         {canNativeShare && (
-          <button type="button" className="icon-btn" aria-label="Share to another app" onClick={nativeShare}>
+          <button
+            type="button"
+            className={`icon-btn relative ${shareState === 'loading' ? 'animate-pulse' : ''}`}
+            aria-label={shareState === 'loading' ? 'Preparing file to share' : shareState === 'ready' ? 'File ready, tap to share' : 'Share to another app'}
+            onPointerDown={prepareShare}
+            onClick={nativeShare}
+          >
             <Share2 className="w-4 h-4" />
+            {shareState === 'ready' && <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-live" />}
           </button>
         )}
         {item.kind !== 'text' && (

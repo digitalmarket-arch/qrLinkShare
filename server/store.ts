@@ -4,6 +4,12 @@
  * Everything lives in RAM and expires automatically (ITEM_TTL_HOURS, default 24h).
  * That keeps the app simple and private, but it means a server restart clears
  * shared items. For permanent storage, swap the `files` map for S3 / Cloudflare R2.
+ *
+ * Memory rules:
+ *  - every item (file OR note) counts toward its room, its uploader and the server total;
+ *  - when the server is full, NEW uploads are refused. Nobody else's files are ever
+ *    deleted to make room;
+ *  - one uploader (IP address) may hold at most MAX_USER_MB (default: a quarter of the total).
  */
 import type {
   DeviceInfo,
@@ -20,6 +26,10 @@ export const PAIR_TTL_MS = 3 * 60 * 1000;
 const MAX_ITEMS_PER_ROOM = 200;
 export const MAX_ROOM_BYTES = Number(process.env.MAX_ROOM_MB || 200) * 1024 * 1024;
 const MAX_TOTAL_BYTES = Number(process.env.MAX_STORE_MB || 512) * 1024 * 1024;
+/** Per uploader (IP address). Default: a quarter of the server's storage. */
+const MAX_OWNER_BYTES = process.env.MAX_USER_MB ? Number(process.env.MAX_USER_MB) * 1024 * 1024 : Math.floor(MAX_TOTAL_BYTES / 4);
+/** How long uploads still in flight from a device's old room are redirected after it pairs. */
+const MOVED_TO_TTL_MS = 15 * 60 * 1000;
 
 export interface StoredFile {
   meta: FileMeta;
@@ -35,8 +45,8 @@ export interface Room {
   devices: Map<string, PresentDevice>; // keyed by connection id
   pairing?: PairingCode;
   bytes: number;
-  /** Another device has joined this room at some point (so never move its items away). */
-  everShared?: boolean;
+  /** This device just paired elsewhere; anything still arriving here goes there instead. */
+  movedTo?: { roomId: string; until: number };
 }
 
 /** A PIN record and its QR-token twin point at each other, so using one always revokes both. */
@@ -51,12 +61,20 @@ type Listener = (roomId: string, event: Record<string, unknown>) => void;
 
 const byNewest = (a: SharedItem, b: SharedItem) => b.createdAt.localeCompare(a.createdAt);
 
+/** Approximate RAM cost of an item (JS strings are ~2 bytes per character). */
+export function itemCost(item: Pick<SharedItem, 'text' | 'url'>, data?: Buffer): number {
+  return (data?.length ?? 0) + 2 * ((item.text?.length ?? 0) + (item.url?.length ?? 0)) + 256;
+}
+
 class Store {
   rooms = new Map<string, Room>();
   files = new Map<string, StoredFile>();
   pins = new Map<string, PairRecord>();
   pairTokens = new Map<string, PairRecord>();
   totalBytes = 0;
+  /** itemId -> who stored it and how much memory it uses */
+  private sizes = new Map<string, { bytes: number; owner: string }>();
+  private ownerBytes = new Map<string, number>();
   private listener: Listener = () => {};
 
   onEvent(listener: Listener) {
@@ -83,9 +101,29 @@ class Store {
     return id;
   }
 
+  /** Where new items for this room should go (follows a recent move after pairing). */
+  resolveRoom(roomId: string): string {
+    const moved = this.rooms.get(roomId)?.movedTo;
+    return moved && moved.until > Date.now() ? moved.roomId : roomId;
+  }
+
   /* ------------------------------- items ------------------------------- */
 
-  addItem(roomId: string, item: Omit<SharedItem, 'id' | 'roomId' | 'createdAt' | 'expiresAt'>, data?: Buffer): SharedItem {
+  /** Returns a user-facing reason if this upload can't be stored right now, else null. */
+  refuse(owner: string, bytes: number): string | null {
+    if (this.totalBytes + bytes > MAX_TOTAL_BYTES) return 'The server is full right now. Please try again later.';
+    if ((this.ownerBytes.get(owner) ?? 0) + bytes > MAX_OWNER_BYTES) {
+      return 'You are storing a lot already. Delete some items or wait for them to expire.';
+    }
+    return null;
+  }
+
+  addItem(
+    roomId: string,
+    owner: string,
+    item: Omit<SharedItem, 'id' | 'roomId' | 'createdAt' | 'expiresAt'>,
+    data?: Buffer
+  ): SharedItem {
     const room = this.room(roomId);
     const now = Date.now();
     const full: SharedItem = {
@@ -97,30 +135,39 @@ class Store {
     };
 
     if (full.file && data) {
-      this.files.set(full.file.fileId, {
-        meta: full.file,
-        roomId,
-        itemId: full.id,
-        data,
-        expiresAt: now + ITEM_TTL_MS,
-      });
-      room.bytes += data.length;
-      this.totalBytes += data.length;
+      this.files.set(full.file.fileId, { meta: full.file, roomId, itemId: full.id, data, expiresAt: now + ITEM_TTL_MS });
     }
+    const bytes = itemCost(full, data);
+    this.sizes.set(full.id, { bytes, owner });
+    this.ownerBytes.set(owner, (this.ownerBytes.get(owner) ?? 0) + bytes);
+    room.bytes += bytes;
+    this.totalBytes += bytes;
 
     room.items.unshift(full);
     this.emit(roomId, { type: 'item:new', item: full });
-    this.enforceLimits(room);
+    this.enforceRoomLimits(room);
     return full;
+  }
+
+  /** Frees an item's memory and bookkeeping (no events). */
+  private forget(item: SharedItem, room: Room) {
+    if (item.file) this.files.delete(item.file.fileId);
+    const size = this.sizes.get(item.id);
+    if (!size) return;
+    this.sizes.delete(item.id);
+    room.bytes -= size.bytes;
+    this.totalBytes -= size.bytes;
+    const left = (this.ownerBytes.get(size.owner) ?? 0) - size.bytes;
+    if (left > 0) this.ownerBytes.set(size.owner, left);
+    else this.ownerBytes.delete(size.owner);
   }
 
   removeItem(roomId: string, itemId: string): boolean {
     const room = this.rooms.get(roomId);
-    if (!room) return false;
-    const item = room.items.find((i) => i.id === itemId);
-    if (!item) return false;
+    const item = room?.items.find((i) => i.id === itemId);
+    if (!room || !item) return false;
     room.items = room.items.filter((i) => i.id !== itemId);
-    if (item.file) this.dropFile(item.file.fileId, room);
+    this.forget(item, room);
     this.emit(roomId, { type: 'item:removed', itemId });
     return true;
   }
@@ -128,64 +175,47 @@ class Store {
   clearRoom(roomId: string) {
     const room = this.rooms.get(roomId);
     if (!room) return;
-    for (const item of room.items) if (item.file) this.dropFile(item.file.fileId, room);
+    for (const item of room.items) this.forget(item, room);
     room.items = [];
     this.emit(roomId, { type: 'room:cleared' });
   }
 
   /**
-   * Moves everything a device shared in its old (solo) room into the room it just
-   * joined, so a note sent before pairing isn't lost. Only call this when nobody
-   * else is in the old room.
+   * A device that was alone in its own room just joined another room: bring along
+   * what it shared, so a note sent before pairing isn't lost, and send anything
+   * still uploading to the new room too. The caller checks that it's safe.
    */
   moveItems(fromRoomId: string, toRoomId: string) {
-    const from = this.rooms.get(fromRoomId);
-    if (!from || fromRoomId === toRoomId || from.items.length === 0) return;
+    if (fromRoomId === toRoomId) return;
+    const from = this.room(fromRoomId);
     const to = this.room(toRoomId);
+    from.movedTo = { roomId: toRoomId, until: Date.now() + MOVED_TO_TTL_MS };
+    if (from.items.length === 0) return;
     const moving = [...from.items].reverse(); // oldest first
     from.items = [];
     for (const item of moving) {
       item.roomId = toRoomId;
       if (item.file) {
         const f = this.files.get(item.file.fileId);
-        if (f) {
-          f.roomId = toRoomId;
-          from.bytes -= f.data.length;
-          to.bytes += f.data.length;
-        }
+        if (f) f.roomId = toRoomId;
       }
+      const bytes = this.sizes.get(item.id)?.bytes ?? 0;
+      from.bytes -= bytes;
+      to.bytes += bytes;
       to.items.push(item);
       this.emit(toRoomId, { type: 'item:new', item });
     }
     to.items.sort(byNewest);
     this.emit(fromRoomId, { type: 'room:cleared' });
-    this.enforceLimits(to);
+    this.enforceRoomLimits(to);
   }
 
-  private dropFile(fileId: string, room?: Room) {
-    const f = this.files.get(fileId);
-    if (!f) return;
-    this.files.delete(fileId);
-    this.totalBytes -= f.data.length;
-    const r = room ?? this.rooms.get(f.roomId);
-    if (r) r.bytes -= f.data.length;
-  }
-
-  private enforceLimits(room: Room) {
-    // Oldest items go first when a room is too big or has too many items.
+  /** Oldest items go first when a room is too big or has too many items. */
+  private enforceRoomLimits(room: Room) {
     while (room.items.length > MAX_ITEMS_PER_ROOM || room.bytes > MAX_ROOM_BYTES) {
       const oldest = room.items[room.items.length - 1];
       if (!oldest) break;
       this.removeItem(room.id, oldest.id);
-    }
-    // Server-wide cap: trim the room holding the most data (normally whoever is
-    // flooding the server), never someone else's small room first.
-    while (this.totalBytes > MAX_TOTAL_BYTES) {
-      let heaviest: Room | undefined;
-      for (const r of this.rooms.values()) if (r.bytes > 0 && (!heaviest || r.bytes > heaviest.bytes)) heaviest = r;
-      const victim = heaviest && [...heaviest.items].reverse().find((i) => i.file);
-      if (!heaviest || !victim) break;
-      this.removeItem(heaviest.id, victim.id);
     }
   }
 
@@ -220,7 +250,6 @@ class Store {
     this.revoke(rec.pin, rec.pairToken);
     const room = this.room(rec.roomId);
     if (room.pairing?.pin === rec.pin) room.pairing = undefined;
-    room.everShared = true;
     this.emit(room.id, { type: 'pair:used', by: device });
     return room.id;
   }
@@ -263,9 +292,9 @@ class Store {
         this.revoke(room.pairing.pin, room.pairing.pairToken);
         room.pairing = undefined;
       }
-      // Keep rooms that still have a live pairing code, otherwise the code's
-      // one-time revoke would have nothing to point at.
-      if (room.items.length === 0 && room.devices.size === 0 && !room.pairing) this.rooms.delete(room.id);
+      if (room.movedTo && room.movedTo.until < now) room.movedTo = undefined;
+      // Keep rooms that still have a live pairing code or redirect.
+      if (room.items.length === 0 && room.devices.size === 0 && !room.pairing && !room.movedTo) this.rooms.delete(room.id);
     }
     for (const [pin, rec] of this.pins) if (rec.expiresAt < now) this.pins.delete(pin);
     for (const [t, rec] of this.pairTokens) if (rec.expiresAt < now) this.pairTokens.delete(t);

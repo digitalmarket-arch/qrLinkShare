@@ -38,9 +38,21 @@ export function Composer({ session, peerCount, onSent }: Props) {
     if (!value || sending) return;
     if (value.length > MAX_TEXT_CHARS) {
       // Very long notes travel as a .txt file instead of being cut off.
+      // The box is only cleared once the upload succeeded, so a failure loses nothing.
       const stamp = new Date().toISOString().slice(0, 16).replace(/[T:]/g, '-');
-      addFiles([new File([text], `note-${stamp}.txt`, { type: 'text/plain' })]);
-      setText('');
+      const sent = text;
+      const [upload] = addFiles([new File([sent], `note-${stamp}.txt`, { type: 'text/plain' })]);
+      if (!upload) return;
+      setSending(true);
+      try {
+        await upload;
+        setText((t) => (t === sent ? '' : t));
+      } catch {
+        // addFiles already showed the error toast
+      } finally {
+        setSending(false);
+        textRef.current?.focus();
+      }
       return;
     }
     setSending(true);
@@ -67,7 +79,9 @@ export function Composer({ session, peerCount, onSent }: Props) {
     }
   };
 
-  const addFiles = (files: FileList | File[]) => {
+  /** Starts uploading each file. Returns one promise per accepted file (rejects on failure). */
+  const addFiles = (files: FileList | File[]): Promise<SharedItem>[] => {
+    const started: Promise<SharedItem>[] = [];
     for (const file of Array.from(files)) {
       if (file.size > MAX_FILE_BYTES) {
         toast({ tone: 'error', title: `${file.name} is too large`, body: `Max ${formatBytes(MAX_FILE_BYTES)} per file.` });
@@ -79,13 +93,19 @@ export function Composer({ session, peerCount, onSent }: Props) {
         setUploads((list) => list.map((u) => (u.key === key ? { ...u, progress: p } : u)))
       );
       setUploads((list) => [...list, { key, name: file.name || 'Pasted file', size: file.size, progress: 0, cancel }]);
+      started.push(promise);
       promise
-        .then((item) => onSent(item))
+        .then((item) => {
+          if (item.roomId !== sessionRef.current.roomId) {
+            toast({ tone: 'error', title: `${file.name} went to your previous room`, body: 'Please send it again.' });
+          } else onSent(item);
+        })
         .catch((err) => {
           if (err?.status !== -1) toast({ tone: 'error', title: `${file.name} failed`, body: err?.message });
         })
         .finally(() => setUploads((list) => list.filter((u) => u.key !== key)));
     }
+    return started;
   };
 
   const addFilesRef = useRef(addFiles);
@@ -93,7 +113,7 @@ export function Composer({ session, peerCount, onSent }: Props) {
 
   // Drop files anywhere on the page, or paste a screenshot with Ctrl/Cmd+V.
   useEffect(() => {
-    const addFiles = (files: FileList | File[]) => addFilesRef.current(files);
+    const addFiles = (files: FileList | File[]) => void addFilesRef.current(files);
     let depth = 0;
     const hasFiles = (e: DragEvent) => Array.from(e.dataTransfer?.types || []).includes('Files');
     const enter = (e: DragEvent) => {

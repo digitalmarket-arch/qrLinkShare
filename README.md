@@ -62,9 +62,9 @@ Real-time sharing needs the Node server running somewhere. **GitHub Pages alone 
 
 Caveats of the free plan:
 - It sleeps after 15 minutes without visitors, so the first visit takes about 30 seconds. Because files are kept in memory, a sleep or restart also clears shared items.
-- It has 512 MB of RAM, so `render.yaml` caps stored files at 150 MB in total (`MAX_STORE_MB`). Keep that well below the RAM size or the server will crash when it fills up.
+- It has 512 MB of RAM, so `render.yaml` caps stored items at 150 MB in total (`MAX_STORE_MB`) and 60 MB per person (`MAX_USER_MB`). When the server is full, new uploads are politely refused until old items expire. Keep `MAX_STORE_MB` well below the RAM size.
 
-A paid plan (about $7/month) removes both limits. If you upgrade, you can raise `MAX_STORE_MB`. Any Node host that supports WebSockets works the same way (Railway, Fly.io, a VPS).
+A paid plan (about $7/month) removes both limits. If you upgrade, you can raise `MAX_STORE_MB`. Any Node host that supports WebSockets works the same way (Railway, Fly.io, a VPS). On those hosts, also set `PUBLIC_ORIGIN` to your site's address, otherwise wallet sign-in is switched off for safety.
 
 **Optional: frontend on GitHub Pages + server on Render.**
 1. In GitHub, set the repository variable `VITE_SERVER_URL` (Settings → Secrets and variables → Actions → Variables) to your server URL, e.g. `https://qrlinkshare.onrender.com`. The included workflow then publishes the page on every push to `main`. It does nothing until this variable is set.
@@ -88,8 +88,8 @@ There's nothing to set up. It uses the standard browser wallet API (EIP-1193 / E
 See `.env.example`. The important ones:
 
 - **`SERVER_SECRET`**: without it, a random secret is used and every device has to pair again after a restart.
-- **`PUBLIC_ORIGIN`**: your site's address, e.g. `https://share.example.com`. It's used in wallet sign-in messages and is detected automatically on Render.
-- **`MAX_STORE_MB`** / **`MAX_ROOM_MB`** / **`UPLOAD_MB_PER_HOUR`**: memory limits for shared files.
+- **`PUBLIC_ORIGIN`**: your site's address, e.g. `https://share.example.com`. Wallet sign-in messages only ever name this address. It's **required for wallet sign-in** on a VPS, Railway, Fly or behind nginx. It's not needed on Render (detected automatically) or when testing on localhost / your home Wi-Fi.
+- **`MAX_STORE_MB`** / **`MAX_ROOM_MB`** / **`MAX_USER_MB`** / **`UPLOAD_MB_PER_HOUR`**: memory limits for shared items. Note that "per user" is really "per IP address". On mobile data in India, many people can share one IP (carrier-grade NAT), so don't set `MAX_USER_MB` too low.
 
 ## Privacy & security, in plain words
 

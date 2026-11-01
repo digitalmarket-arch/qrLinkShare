@@ -109,7 +109,7 @@ async function main() {
   /* --------------------------- pairing carry-over -------------------------- */
   const desk = (await post('/api/rooms', {})).data;
   const phone = (await post('/api/rooms', {})).data;
-  await post(`/api/rooms/${phone.roomId}/items`, { text: 'sent before pairing' }, auth(phone));
+  await post(`/api/rooms/${phone.roomId}/items`, { text: 'sent before pairing' }, { ...auth(phone), 'X-Device-Id': 'phone-1' });
   const deskCode = (await post(`/api/rooms/${desk.roomId}/pair`, {}, auth(desk))).data;
   const joined = (await post('/api/pair/claim', { pin: deskCode.pin, fromToken: phone.token }, { 'X-Device-Id': 'phone-1' })).data;
   const deskItems = await new Promise<any[]>((resolve) => {
@@ -125,6 +125,28 @@ async function main() {
   });
   check('items sent before pairing move into the joined room', joined.roomId === desk.roomId && deskItems.some((i) => i.text === 'sent before pairing'));
 
+  // An upload that was still in flight from the old room lands in the new room too.
+  const late = await post(`/api/rooms/${phone.roomId}/items`, { text: 'late upload' }, { ...auth(phone), 'X-Device-Id': 'phone-1' });
+  check('in-flight sends from the old room follow the device', late.data.item?.roomId === desk.roomId);
+
+  // A device that JOINED a room (PIN/QR token) can never pull that room's items elsewhere.
+  const other = (await post('/api/rooms', {})).data;
+  const otherCode = (await post(`/api/rooms/${other.roomId}/pair`, {}, auth(other))).data;
+  await post(`/api/rooms/${desk.roomId}/items`, { text: 'desk private note' }, { ...auth(desk), 'X-Device-Id': 'desk-1' });
+  await post('/api/pair/claim', { pin: otherCode.pin, fromToken: joined.token }, { 'X-Device-Id': 'phone-1' });
+  const deskAfter = await new Promise<any[]>((resolve) => {
+    const ws = new WebSocket(BASE.replace(/^http/, 'ws') + '/ws');
+    ws.on('open', () => ws.send(JSON.stringify({ type: 'hello', token: desk.token, device: { id: 'desk-1', name: 'Desk' } })));
+    ws.on('message', (raw) => {
+      const m = JSON.parse(raw.toString());
+      if (m.type === 'ready') {
+        ws.close();
+        resolve(m.items);
+      }
+    });
+  });
+  check("a paired device can't move the room's items away", deskAfter.some((i) => i.text === 'desk private note'));
+
   /* ---------------------------- websocket safety --------------------------- */
   const crash = async (frame: string) =>
     new Promise<void>((resolve) => {
@@ -138,6 +160,16 @@ async function main() {
       }, 500);
     });
   await crash('null');
+  await crash('x'.repeat(20 * 1024)); // over the 16 KB frame limit
+  await new Promise<void>((resolve) => {
+    // a text frame that isn't valid UTF-8
+    const ws = new WebSocket(BASE.replace(/^http/, 'ws') + '/ws');
+    ws.on('open', () => {
+      (ws as any)._socket.write(Buffer.from([0x81, 0x83, 0, 0, 0, 0, 0xff, 0xfe, 0xfd]));
+      setTimeout(resolve, 300);
+    });
+    ws.on('error', () => resolve());
+  });
   await crash('[]');
   await crash(JSON.stringify({ type: 'hello', token: a.token, device: { id: { toString: 1 }, name: { toString: 1 } } }));
   const alive = await fetch(`${BASE}/api/health`).then((r) => r.ok).catch(() => false);
@@ -145,6 +177,14 @@ async function main() {
 
   const imgRes = await fetch(`${BASE}/api/files/${svg.file.fileId}`);
   check('file responses allow cross-origin fetch (share from GitHub Pages)', imgRes.headers.get('access-control-allow-origin') === '*');
+
+  const txt = await up('note.txt', 'text/plain', 'नमस्ते ₹');
+  const txtRes = await fetch(`${BASE}/api/files/${txt.file.fileId}`);
+  check('text files declare UTF-8 (Hindi/₹ display correctly)', /charset=utf-8/i.test(txtRes.headers.get('content-type') || ''));
+
+  const bad400 = await fetch(`${BASE}/%E0%A4%A`);
+  const body400 = await bad400.text();
+  check('error pages never show stack traces', !/at |node_modules/.test(body400), body400.slice(0, 60));
 
   /* ------------------------------ rate limiting ---------------------------- */
   let limited = false;

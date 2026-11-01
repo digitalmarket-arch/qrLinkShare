@@ -18,5 +18,7 @@ services:
         value: "150"
       - key: MAX_ROOM_MB
         value: "100"
+      - key: MAX_USER_MB
+        value: "60"
       - key: UPLOAD_MB_PER_HOUR
-        value: "150"
+        value: "100"

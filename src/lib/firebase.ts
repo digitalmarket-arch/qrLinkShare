@@ -1,6 +1,7 @@
 /**
  * Google sign-in through Firebase Authentication (Google's sign-in service).
- * Only used to recognise "my own devices": no data is stored in Firebase.
+ * Only used to recognise "my own devices". Like any Google sign-in, Firebase keeps a sign-in
+ * record (account id, email, name, sign-in times); nothing you share is ever stored there.
  * Loaded lazily, so people who never use Google sign-in don't download it.
  */
 import { initializeApp } from 'firebase/app';

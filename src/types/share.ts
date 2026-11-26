@@ -51,7 +51,7 @@ export interface WireItem {
 
 /**
  * - ready: complete and usable
- * - pending: created on this device while no other device was connected; sent when one connects
+ * - pending: created on this device and not yet confirmed by any other device; sent when one connects
  * - receiving: a file still arriving from another device
  * - failed: a file transfer that didn't finish
  */
@@ -78,10 +78,13 @@ export type LinkMethod = 'paired' | 'google' | 'wallet';
 
 export interface ConnectedDevice extends DeviceInfo {
   method: LinkMethod;
+  /** A "keep nothing" device: it's a new device on every visit, so it isn't remembered. */
+  ephemeral?: boolean;
 }
 
 /** A signed-in account whose devices connect automatically. */
 export type Account =
-  | { kind: 'google'; uid: string; label: string }
+  /** met: this device has already connected with another device of the account. */
+  | { kind: 'google'; uid: string; label: string; met?: boolean }
   /** roomKey: derived from the wallet's signature of a fixed message (only the wallet can produce it). */
   | { kind: 'wallet'; address: string; label: string; roomKey: string };

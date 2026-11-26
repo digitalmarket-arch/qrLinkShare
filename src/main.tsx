@@ -1,3 +1,5 @@
+// Must stay first: fills in newer browser features before anything else loads.
+import './polyfills';
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App.tsx';

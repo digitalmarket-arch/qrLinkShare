@@ -10,10 +10,17 @@
 import type { StoredItem } from '../types/share';
 
 export interface Store {
+  /** True when items survive closing the tab (IndexedDB); false for the memory store. */
   readonly persistent: boolean;
   list(): Promise<StoredItem[]>;
   get(id: string): Promise<StoredItem | undefined>;
   put(item: StoredItem): Promise<void>;
+  /**
+   * Changes an item only if it still exists, in one step (so a delete happening at the
+   * same moment can't be undone by this write). `fn` returns the new item, or null for
+   * "no change". Resolves with the stored item, or undefined if it's gone.
+   */
+  update(id: string, fn: (item: StoredItem) => StoredItem | null): Promise<StoredItem | undefined>;
   getBlob(id: string): Promise<Blob | undefined>;
   putBlob(id: string, blob: Blob): Promise<void>;
   remove(id: string): Promise<void>;
@@ -35,6 +42,14 @@ export function createMemoryStore(): Store {
     list: async () => [...items.values()],
     get: async (id) => items.get(id),
     put: async (item) => void items.set(item.id, { ...item }),
+    update: async (id, fn) => {
+      const cur = items.get(id);
+      if (!cur) return undefined;
+      const next = fn({ ...cur });
+      if (!next) return cur;
+      items.set(id, { ...next });
+      return next;
+    },
     getBlob: async (id) => blobs.get(id),
     putBlob: async (id, blob) => void blobs.set(id, blob),
     remove: async (id) => {
@@ -107,6 +122,23 @@ async function idbStore(): Promise<Store> {
     list: () => run(['items'], 'readonly', (tx) => promisify(tx.objectStore('items').getAll() as IDBRequest<StoredItem[]>)),
     get: (id) => run(['items'], 'readonly', (tx) => promisify(tx.objectStore('items').get(id) as IDBRequest<StoredItem | undefined>)),
     put: (item) => run(['items'], 'readwrite', (tx) => void tx.objectStore('items').put(item)),
+    update: (id, fn) =>
+      run(['items'], 'readwrite', (tx) => {
+        const os = tx.objectStore('items');
+        // Read and write inside the same transaction: nothing can run in between.
+        return new Promise<StoredItem | undefined>((resolve, reject) => {
+          const req = os.get(id) as IDBRequest<StoredItem | undefined>;
+          req.onsuccess = () => {
+            const cur = req.result;
+            if (!cur) return resolve(undefined);
+            const next = fn(cur);
+            if (!next) return resolve(cur);
+            os.put(next);
+            resolve(next);
+          };
+          req.onerror = () => reject(req.error);
+        });
+      }),
     getBlob: async (id) => {
       const rec = await run(['blobs'], 'readonly', (tx) => promisify(tx.objectStore('blobs').get(id) as IDBRequest<BlobRecord | undefined>));
       if (!rec) return undefined;
@@ -166,6 +198,16 @@ export function deleteDatabase(): Promise<void> {
       resolve();
     }
   });
+}
+
+/** Whether the browser has promised not to clear our data when space runs low (null = can't tell). */
+export async function isPersisted(): Promise<boolean | null> {
+  try {
+    const fn = navigator.storage?.persisted;
+    return fn ? await fn.call(navigator.storage) : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Asks the browser not to clear our data when space runs low (best effort). */

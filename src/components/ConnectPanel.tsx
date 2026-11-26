@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useState } from 'react';
-import { ChevronDown, Copy, KeyRound, Loader2, QrCode as QrIcon, RefreshCw, ScanLine, Wallet } from 'lucide-react';
+import { CameraOff, ChevronDown, Copy, KeyRound, Loader2, QrCode as QrIcon, RefreshCw, ScanLine, Wallet } from 'lucide-react';
 import type { Account, DeviceInfo } from '../types/share';
 import type { Mesh } from '../lib/mesh';
 import { formatPin } from '../lib/shared';
@@ -9,8 +9,26 @@ import { QrCode } from './QrCode';
 import { PinInput } from './PinInput';
 import { useToast } from './Toasts';
 
-// The camera scanner (and its QR decoder) only loads when someone opens the Scan tab.
-const QrScanner = lazy(() => import('./QrScanner').then((m) => ({ default: m.QrScanner })));
+/** The camera scanner (and its QR decoder) is a separate download. */
+const loadScanner = () => import('./QrScanner');
+const QrScanner = lazy(() =>
+  loadScanner()
+    .then((m) => ({ default: m.QrScanner }))
+    // Offline, or a new version replaced the old files: show a message instead of a blank page.
+    .catch(() => ({ default: ScannerUnavailable }))
+);
+
+function ScannerUnavailable() {
+  return (
+    <div className="aspect-square rounded-2xl bg-surface-2 flex flex-col items-center justify-center gap-3 p-6 text-center">
+      <CameraOff className="w-8 h-8 text-muted" />
+      <p className="text-sm text-muted">Couldn’t load the camera scanner. You may be offline, or a new version of qrLinkShare is out.</p>
+      <button type="button" className="btn btn-outline text-sm" onClick={() => location.reload()}>
+        Reload
+      </button>
+    </div>
+  );
+}
 
 type Tab = 'show' | 'pin' | 'scan';
 
@@ -19,11 +37,14 @@ interface Props {
   groupSecret: string;
   account: Account | null;
   isMobile: boolean;
-  /** Other devices are already connected, so show a compact version. */
+  /** This device already has paired / signed-in devices, so show a compact version. */
   compact: boolean;
   /** Set while joining another device; shows what is happening. */
   joining: string | null;
-  onKnock: (device: DeviceInfo) => Promise<boolean>;
+  onCancelJoin: () => void;
+  hasPaired: () => boolean;
+  onKnock: (device: DeviceInfo, signal: AbortSignal) => Promise<boolean>;
+  onAdopt: (secret: string, device: DeviceInfo) => Promise<void>;
   onPaired: (device: DeviceInfo, via: 'qr' | 'pin') => void;
   onEnterPin: (pin: string) => void;
   onScanned: (text: string) => void;
@@ -39,12 +60,24 @@ export function ConnectPanel(props: Props) {
 
   useEffect(() => setExpanded(!compact), [compact]);
 
-  const showing = expanded && tab === 'show' && !joining;
+  // Fetch the scanner in the background once the app has settled, so the Scan tab works
+  // offline and keeps working when a new version is published while this tab stays open.
+  useEffect(() => {
+    const prefetch = () => void loadScanner().catch(() => {});
+    const ric = (window as Partial<Pick<Window, 'requestIdleCallback'>>).requestIdleCallback;
+    if (ric) ric(prefetch, { timeout: 5000 });
+    else setTimeout(prefetch, 3000);
+  }, []);
+
+  const open = expanded || !!joining;
+  const showing = open && tab === 'show' && !joining;
   const pairing = usePairing({
     mesh,
     enabled: showing,
     groupSecret: props.groupSecret,
+    hasPaired: props.hasPaired,
     onKnock: props.onKnock,
+    onAdopt: props.onAdopt,
     onPaired: props.onPaired,
   });
 
@@ -59,7 +92,7 @@ export function ConnectPanel(props: Props) {
       <button
         type="button"
         className="w-full flex items-center justify-between gap-3 text-left"
-        aria-expanded={expanded}
+        aria-expanded={open}
         onClick={() => setExpanded((v) => !v)}
         disabled={!compact}
       >
@@ -76,18 +109,21 @@ export function ConnectPanel(props: Props) {
           </p>
         </div>
         {compact && (
-          <ChevronDown className={`w-5 h-5 text-muted shrink-0 transition-transform ${expanded ? 'rotate-180' : ''}`} />
+          <ChevronDown className={`w-5 h-5 text-muted shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} />
         )}
       </button>
 
-      {expanded && joining && (
+      {joining && (
         <div className="mt-5 rounded-2xl bg-surface-2 p-5 flex items-center gap-3" aria-live="polite">
           <Loader2 className="w-5 h-5 animate-spin text-brand shrink-0" />
-          <p className="text-sm">{joining}</p>
+          <p className="text-sm flex-1 min-w-0">{joining}</p>
+          <button type="button" className="btn btn-ghost text-sm min-h-9 px-3 shrink-0" onClick={props.onCancelJoin}>
+            Cancel
+          </button>
         </div>
       )}
 
-      {expanded && !joining && (
+      {open && !joining && (
         <div className="mt-5">
           <div role="tablist" aria-label="Pairing method" className="grid grid-cols-3 gap-1 p-1 rounded-xl bg-surface-2">
             {tabs.map((t) => (

@@ -1,12 +1,18 @@
 /**
- * Small settings kept in the browser. Pairing details go to sessionStorage (this
- * tab only) when "keep nothing on this computer" is on, otherwise localStorage.
+ * Small settings kept in the browser (localStorage).
+ *
+ * With "keep nothing on this computer" on, pairing details are kept only in this
+ * page's memory: closing, reopening or reloading the tab starts unpaired, so the
+ * next person at a shared computer can't pick up where you left off.
  */
 import type { Account, DeviceInfo, KnownDevice } from '../types/share';
 import { deviceNameFromUA, deviceTypeFromUA } from './shared';
 import { isValidSecret, randomSecret } from './pairing';
 
-function read<T>(storage: Storage | undefined, key: string): T | null {
+/** The subset of the Storage API used here. */
+type KV = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
+
+function read<T>(storage: KV | undefined, key: string): T | null {
   try {
     const raw = storage?.getItem(key);
     return raw ? (JSON.parse(raw) as T) : null;
@@ -15,7 +21,7 @@ function read<T>(storage: Storage | undefined, key: string): T | null {
   }
 }
 
-function write(storage: Storage | undefined, key: string, value: unknown) {
+function write(storage: KV | undefined, key: string, value: unknown) {
   try {
     if (value === null || value === undefined) storage?.removeItem(key);
     else storage?.setItem(key, JSON.stringify(value));
@@ -24,15 +30,42 @@ function write(storage: Storage | undefined, key: string, value: unknown) {
   }
 }
 
-const local = () => (typeof localStorage === 'undefined' ? undefined : localStorage);
-const session = () => (typeof sessionStorage === 'undefined' ? undefined : sessionStorage);
+const local = (): KV | undefined => {
+  try {
+    return typeof localStorage === 'undefined' ? undefined : localStorage;
+  } catch {
+    return undefined;
+  }
+};
+const session = (): KV | undefined => {
+  try {
+    return typeof sessionStorage === 'undefined' ? undefined : sessionStorage;
+  } catch {
+    return undefined;
+  }
+};
+
+/** Memory-only storage for "keep nothing" mode: gone as soon as the page is. */
+const memoryMap = new Map<string, string>();
+const memory: KV = {
+  getItem: (k) => memoryMap.get(k) ?? null,
+  setItem: (k, v) => void memoryMap.set(k, String(v)),
+  removeItem: (k) => void memoryMap.delete(k),
+};
+
+/** Everything that identifies this device's pairings. */
+const PAIRING_KEYS = ['qrls.group', 'qrls.oldGroups', 'qrls.account', 'qrls.known', 'qrls.gone'];
 
 /* ------------------------- "keep nothing" (private) ------------------------- */
 
 export const isPrivateMode = () => read<boolean>(local(), 'qrls.private') === true;
 export const setPrivateMode = (on: boolean) => write(local(), 'qrls.private', on || null);
 
-const scoped = () => (isPrivateMode() ? session() : local());
+// Earlier versions kept "keep nothing" pairing details in sessionStorage, which browsers
+// bring back when a closed tab is reopened. Clear any leftovers.
+if (isPrivateMode()) for (const k of PAIRING_KEYS) write(session(), k, null);
+
+const scoped = (): KV | undefined => (isPrivateMode() ? memory : local());
 
 /* --------------------------------- pairing --------------------------------- */
 
@@ -47,6 +80,25 @@ export function loadGroupSecret(): string {
 
 export const saveGroupSecret = (secret: string) => write(scoped(), 'qrls.group', secret);
 
+/**
+ * Groups this device moved away from when it paired with a device of another group.
+ * It keeps visiting them for a while to tell devices that come back where to find it.
+ */
+export interface OldGroup {
+  secret: string;
+  since: number;
+}
+const OLD_GROUP_DAYS = 30;
+const MAX_OLD_GROUPS = 5;
+
+export function loadOldGroups(now = Date.now()): OldGroup[] {
+  const list = read<OldGroup[]>(scoped(), 'qrls.oldGroups') ?? [];
+  return list
+    .filter((g) => g && isValidSecret(g.secret) && typeof g.since === 'number' && now - g.since < OLD_GROUP_DAYS * 86_400_000)
+    .slice(0, MAX_OLD_GROUPS);
+}
+export const saveOldGroups = (groups: OldGroup[]) => write(scoped(), 'qrls.oldGroups', groups.slice(0, MAX_OLD_GROUPS));
+
 export const loadAccount = () => read<Account>(scoped(), 'qrls.account');
 export const saveAccount = (account: Account | null) => write(scoped(), 'qrls.account', account);
 
@@ -54,13 +106,25 @@ export const saveAccount = (account: Account | null) => write(scoped(), 'qrls.ac
 export const loadKnownDevices = () => read<Record<string, KnownDevice>>(scoped(), 'qrls.known') ?? {};
 export const saveKnownDevices = (known: Record<string, KnownDevice>) => write(scoped(), 'qrls.known', known);
 
-/** Removes pairing details from both storages (used when switching modes). */
+/**
+ * Items deleted on this device (id -> when). If another device sends one again (for
+ * example because our receipt got lost), it is acknowledged instead of coming back.
+ */
+const GONE_DAYS = 45;
+const MAX_GONE = 3000;
+export function loadGone(now = Date.now()): Record<string, number> {
+  const all = read<Record<string, number>>(scoped(), 'qrls.gone') ?? {};
+  const kept = Object.entries(all)
+    .filter(([, t]) => typeof t === 'number' && now - t < GONE_DAYS * 86_400_000)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, MAX_GONE);
+  return Object.fromEntries(kept);
+}
+export const saveGone = (gone: Record<string, number>) => write(scoped(), 'qrls.gone', gone);
+
+/** Removes pairing details from every storage (used when switching modes). */
 export function forgetPairing() {
-  for (const s of [local(), session()]) {
-    write(s, 'qrls.group', null);
-    write(s, 'qrls.account', null);
-    write(s, 'qrls.known', null);
-  }
+  for (const s of [local(), session(), memory]) for (const k of PAIRING_KEYS) write(s, k, null);
 }
 
 /* --------------------------------- device ---------------------------------- */

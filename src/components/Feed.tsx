@@ -52,7 +52,7 @@ export function Feed(props: Props) {
   const visible = filter === 'all' ? list : list.filter((i) => i.kind === filter);
 
   const sections: Array<{ id: Retention; label: string; icon: typeof Clock; hint: string }> = [
-    { id: 'temp', label: 'Temporary', icon: Clock, hint: 'Gone after 24 h' },
+    { id: 'temp', label: 'Temporary', icon: Clock, hint: 'Deleted after 24 h' },
     { id: 'saved', label: 'Saved', icon: Bookmark, hint: 'Until you delete them' },
   ];
   const filters: Array<{ id: Filter; label: string }> = [
@@ -155,7 +155,7 @@ export function Feed(props: Props) {
         <div className="mt-4 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-muted">
           <span>
             {section === 'temp'
-              ? 'Temporary items delete themselves 24 hours after they were sent.'
+              ? 'Temporary items are deleted 24 hours after they were sent (on a device where qrLinkShare is closed, the next time it opens).'
               : 'Saved items stay on this device until you delete them.'}
           </span>
           <button
@@ -188,7 +188,7 @@ function EmptyState({ section }: { section: Retention }) {
       <p className="mt-4 font-bold">{section === 'temp' ? 'No temporary items' : 'Nothing saved yet'}</p>
       <p className="mt-1 text-sm text-muted">
         {section === 'temp'
-          ? 'Quick hand-offs land here and disappear after 24 hours.'
+          ? 'Quick hand-offs land here and are deleted after 24 hours.'
           : 'Choose “Save” when sending, or tap the bookmark on any temporary item, to keep it here.'}
       </p>
       {section === 'temp' && (

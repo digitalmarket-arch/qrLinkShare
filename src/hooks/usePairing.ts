@@ -15,61 +15,67 @@ const freshCode = (): Code => ({ invite: randomSecret(18), pin: randomPin(), exp
 
 /**
  * While `enabled`, shows a one-time QR invitation + 6-digit PIN for this device and
- * listens for a new device using either. Codes change every 3 minutes and after each use.
+ * listens for a new device using either. Codes change every 3 minutes and after each
+ * use. The 3-minute limit is enforced when a device arrives, so it also holds while
+ * this tab is in the background.
  */
 export function usePairing(opts: {
   mesh: Mesh | null;
   enabled: boolean;
   groupSecret: string;
-  onKnock: (device: DeviceInfo) => Promise<boolean>;
+  hasPaired: () => boolean;
+  onKnock: (device: DeviceInfo, signal: AbortSignal) => Promise<boolean>;
+  onAdopt: (secret: string, device: DeviceInfo) => Promise<void>;
   onPaired: (device: DeviceInfo, via: 'qr' | 'pin') => void;
 }) {
-  const { mesh, enabled, groupSecret } = opts;
+  const { mesh, enabled } = opts;
   const [code, setCode] = useState<Code>(freshCode);
   const [now, setNow] = useState(Date.now());
   const handlers = useRef(opts);
   handlers.current = opts;
-  const secretRef = useRef(groupSecret);
-  secretRef.current = groupSecret;
+  /** While someone is deciding whether to allow a device, the code isn't replaced. */
+  const knocking = useRef(0);
 
   const refresh = useCallback(() => setCode(freshCode()), []);
 
   // Listen for new devices using the current code.
   useEffect(() => {
     if (!mesh || !enabled) return;
-    const stop = mesh.host(
-      { invite: code.invite, pin: code.pin },
-      {
-        groupSecret: () => secretRef.current,
-        onKnock: (d) => handlers.current.onKnock(d),
-        onPaired: (d, via) => {
-          handlers.current.onPaired(d, via);
-          refresh(); // each code works once
-        },
-      }
-    );
+    const stop = mesh.host(code, {
+      groupSecret: () => handlers.current.groupSecret,
+      hasPaired: () => handlers.current.hasPaired(),
+      onKnock: async (d, signal) => {
+        knocking.current++;
+        try {
+          return await handlers.current.onKnock(d, signal);
+        } finally {
+          knocking.current--;
+        }
+      },
+      onAdopt: (secret, d) => handlers.current.onAdopt(secret, d),
+      onPaired: (d, via) => {
+        handlers.current.onPaired(d, via);
+        refresh(); // each code works once
+      },
+    });
     return stop;
-  }, [mesh, enabled, code.invite, code.pin, refresh]);
+  }, [mesh, enabled, code, refresh]);
 
-  // Countdown, and a new code when time is up (only while visible).
+  // Countdown, and a new code when time is up (also in a background tab).
   useEffect(() => {
     if (!enabled) return;
-    const t = setInterval(() => {
+    const tick = () => {
       const n = Date.now();
       setNow(n);
-      if (n >= code.expiresAt && document.visibilityState === 'visible') refresh();
-    }, 1000);
-    return () => clearInterval(t);
-  }, [enabled, code.expiresAt, refresh]);
-
-  // A code that expired while the tab was hidden is replaced when it comes back.
-  useEffect(() => {
-    if (!enabled) return;
-    const onVisible = () => {
-      if (document.visibilityState === 'visible' && Date.now() >= code.expiresAt) refresh();
+      if (n >= code.expiresAt && knocking.current === 0) refresh();
     };
-    document.addEventListener('visibilitychange', onVisible);
-    return () => document.removeEventListener('visibilitychange', onVisible);
+    tick();
+    const t = setInterval(tick, 1000);
+    document.addEventListener('visibilitychange', tick);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener('visibilitychange', tick);
+    };
   }, [enabled, code.expiresAt, refresh]);
 
   const msLeft = Math.max(0, code.expiresAt - now);

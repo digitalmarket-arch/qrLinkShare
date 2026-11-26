@@ -6,7 +6,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
-import { SignJWT, createLocalJWKSet, exportJWK, generateKeyPair } from 'jose';
+import { SignJWT, createLocalJWKSet, exportJWK, generateKeyPair, type JWTVerifyGetKey } from 'jose';
 import { accountRoom, groupRoom, inviteLink, inviteRoom, isValidSecret, parseInviteLink, pinRoom, randomPin, randomSecret } from './pairing';
 import { createMemoryStore } from './db';
 import { isWireItem } from './mesh';
@@ -131,4 +131,31 @@ test('Google check: verifies the token signature, audience and account', async (
   assert.equal(await verifyGoogleToken(await sign({ sub: 'user-1' }, wrongKey), 'user-1', project, { jwks }), false);
   assert.equal(await verifyGoogleToken('not-a-token', 'user-1', project, { jwks }), false);
   assert.equal(await verifyGoogleToken(good, 'user-1', project, { jwks, now: Date.now() + 2 * 3600_000 }), false); // expired
+});
+
+test('Google check: fails closed when Google’s keys can’t be fetched (no unchecked tokens)', async () => {
+  const project = 'demo-project';
+  const offline: JWTVerifyGetKey = async () => {
+    throw new TypeError('Failed to fetch'); // what the browser throws when Google can't be reached
+  };
+  const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  const claims = {
+    sub: 'user-1',
+    iss: `https://securetoken.google.com/${project}`,
+    aud: project,
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(Date.now() / 1000) + 3600,
+  };
+  const unsigned = `${b64({ alg: 'none', typ: 'JWT' })}.${b64(claims)}.`;
+  assert.equal(await verifyGoogleToken(unsigned, 'user-1', project, { jwks: offline }), false);
+  const { privateKey } = await generateKeyPair('RS256');
+  const selfSigned = await new SignJWT({ sub: 'user-1' })
+    .setProtectedHeader({ alg: 'RS256', kid: 'k1' })
+    .setIssuer(claims.iss)
+    .setAudience(project)
+    .setIssuedAt()
+    .setExpirationTime('1h')
+    .sign(privateKey);
+  assert.equal(await verifyGoogleToken(selfSigned, 'user-1', project, { jwks: offline }), false);
+  assert.equal(await verifyGoogleToken(unsigned, 'user-1', project), false); // no network in tests either way
 });

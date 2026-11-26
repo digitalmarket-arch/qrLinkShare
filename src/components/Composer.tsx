@@ -36,13 +36,19 @@ export function Composer({ deviceCount, initialText, sendText, sendFile }: Props
   const isLink = !!toHttpUrl(text);
   const tooLong = text.length > MAX_TEXT_CHARS;
 
-  const notifyQueued = (item: StoredItem | null) => {
-    if (item?.status === 'pending') {
+  const deviceCountRef = useRef(deviceCount);
+  deviceCountRef.current = deviceCount;
+
+  /** Everything is saved on this device first and sent in the background. */
+  const notifyQueued = (stored: Array<StoredItem | null>) => {
+    if (deviceCountRef.current === 0 && stored.some(Boolean)) {
       toast({ tone: 'info', title: 'Saved on this device', body: 'It will be sent as soon as one of your devices connects.' }, 4000);
     }
   };
 
   const addFiles = async (files: FileList | File[]) => {
+    const retention = retentionRef.current; // the choice at the moment of picking applies to the whole batch
+    const stored: Array<StoredItem | null> = [];
     for (const file of Array.from(files)) {
       if (file.size > MAX_FILE_BYTES) {
         toast({ tone: 'error', title: `${file.name} is too large`, body: `Max ${formatBytes(MAX_FILE_BYTES)} per file.` });
@@ -50,11 +56,12 @@ export function Composer({ deviceCount, initialText, sendText, sendFile }: Props
       }
       if (file.size === 0) continue;
       try {
-        notifyQueued(await sendFile(file, retentionRef.current));
+        stored.push(await sendFile(file, retention));
       } catch (err) {
         toast({ tone: 'error', title: `${file.name} could not be saved`, body: err instanceof Error ? err.message : 'Storage may be full.' });
       }
     }
+    notifyQueued(stored);
   };
   const addFilesRef = useRef(addFiles);
   addFilesRef.current = addFiles;
@@ -70,7 +77,7 @@ export function Composer({ deviceCount, initialText, sendText, sendFile }: Props
         const stamp = new Date().toISOString().slice(0, 16).replace(/[T:]/g, '-');
         await addFiles([new File([text], `note-${stamp}.txt`, { type: 'text/plain' })]);
       } else {
-        notifyQueued(await sendText(text, retention));
+        notifyQueued([await sendText(text, retention)]);
       }
       // Saved on this device first, so it's safe to clear the box now.
       setText((t) => (t === text ? '' : t));
@@ -156,7 +163,7 @@ export function Composer({ deviceCount, initialText, sendText, sendFile }: Props
   }, [text]);
 
   const options: Array<{ id: Retention; label: string; hint: string; icon: typeof Clock }> = [
-    { id: 'temp', label: 'Temporary', hint: 'Gone in 24 h', icon: Clock },
+    { id: 'temp', label: 'Temporary', hint: 'Deleted after 24 h', icon: Clock },
     { id: 'saved', label: 'Save', hint: 'Until you delete it', icon: Bookmark },
   ];
 
@@ -230,7 +237,7 @@ export function Composer({ deviceCount, initialText, sendText, sendFile }: Props
           <div className="w-full h-full rounded-3xl border-2 border-dashed border-brand bg-brand-soft/60 flex flex-col items-center justify-center gap-3 text-center">
             <UploadCloud className="w-12 h-12 text-brand" />
             <p className="text-xl font-bold">Drop to send</p>
-            <p className="text-sm text-muted">{retention === 'saved' ? 'Saved on your devices' : 'Temporary: gone after 24 hours'}</p>
+            <p className="text-sm text-muted">{retention === 'saved' ? 'Saved on your devices' : 'Temporary: deleted after 24 hours'}</p>
           </div>
         </div>
       )}

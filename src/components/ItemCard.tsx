@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Archive,
@@ -29,6 +29,8 @@ import {
 import type { FileKind, StoredItem } from '../types/share';
 import { fileKindOf, formatBytes, formatTimeLeft, isInlineSafeMime, msUntilExpiry, timeAgo } from '../lib/shared';
 import { downloadBlob } from '../lib/browser';
+import { splitLinks } from '../lib/linkify';
+import { qrPayloadFor } from '../lib/qrPayload';
 
 const FILE_ICONS: Record<FileKind, typeof File> = {
   image: FileImage,
@@ -75,6 +77,12 @@ export function ItemCard({ item, myDeviceId, fresh, progress, getBlob, onCopy, o
   const isImage = kind === 'image' && !!item.file && /^image\/(png|jpeg|gif|webp|avif|bmp)$/i.test(item.file.mime);
   const canPreview = !!item.file && isInlineSafeMime(item.file.mime) && !isImage;
   const longText = (item.text?.length ?? 0) > 280 || (item.text?.split('\n').length ?? 0) > 6;
+  // Links inside a note become clickable.
+  const noteParts = useMemo(() => (item.kind === 'text' ? splitLinks(item.text ?? '') : []), [item.kind, item.text]);
+  const canShowQr = useMemo(
+    () => qrPayloadFor({ kind: item.kind, text: item.text, url: item.url })?.ok === true,
+    [item.kind, item.text, item.url]
+  );
 
   let Icon = StickyNote;
   if (item.kind === 'link') Icon = Link2;
@@ -200,7 +208,23 @@ export function ItemCard({ item, myDeviceId, fresh, progress, getBlob, onCopy, o
           )}
           {item.kind === 'text' && (
             <div>
-              <p className={`text-[15px] whitespace-pre-wrap break-words ${expanded ? '' : 'line-clamp-6'}`}>{item.text}</p>
+              <p className={`text-[15px] whitespace-pre-wrap break-words ${expanded ? '' : 'line-clamp-6'}`}>
+                {noteParts.map((part, i) =>
+                  part.kind === 'link' ? (
+                    <a
+                      key={i}
+                      href={part.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-brand underline underline-offset-2 break-all"
+                    >
+                      {part.text}
+                    </a>
+                  ) : (
+                    <Fragment key={i}>{part.text}</Fragment>
+                  )
+                )}
+              </p>
               {longText && (
                 <button type="button" className="mt-1 text-sm font-semibold text-brand cursor-pointer" onClick={() => setExpanded((v) => !v)}>
                   {expanded ? 'Show less' : 'Show more'}
@@ -239,7 +263,7 @@ export function ItemCard({ item, myDeviceId, fresh, progress, getBlob, onCopy, o
           {item.status === 'pending' && pct !== null && <p className="mt-1.5 text-xs font-semibold text-brand">Sending {pct}%</p>}
           {item.status === 'failed' && (
             <p className="mt-1.5 text-xs font-semibold text-danger inline-flex items-center gap-1">
-              <AlertTriangle className="w-3.5 h-3.5" /> The file didn’t arrive completely. Ask the other device to send it again.
+              <AlertTriangle className="w-3.5 h-3.5" /> Transfer interrupted. It’s sent again automatically when {item.from.name} is back online.
             </p>
           )}
           {pct !== null && (
@@ -294,7 +318,7 @@ export function ItemCard({ item, myDeviceId, fresh, progress, getBlob, onCopy, o
             <Copy className="w-4 h-4" />
           </button>
         )}
-        {item.kind !== 'file' && (
+        {canShowQr && (
           <button type="button" className="icon-btn" aria-label="Show QR code for this item" onClick={() => onShowQr(item)}>
             <QrCode className="w-4 h-4" />
           </button>

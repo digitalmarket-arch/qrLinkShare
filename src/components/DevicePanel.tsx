@@ -1,11 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
-import { DownloadCloud, HardDrive, ShieldCheck, UploadCloud } from 'lucide-react';
+import { DownloadCloud, HardDrive, Info, ShieldCheck, UploadCloud } from 'lucide-react';
 import { formatBytes } from '../lib/shared';
 import { storageEstimate } from '../lib/db';
+import { isIOS, isStandalone } from '../lib/browser';
 
 interface Props {
   privateMode: boolean;
+  /** Items survive closing the tab (false when the browser blocks storage). */
   persistent: boolean;
+  /** The browser promised not to clear our data (null: unknown). */
+  persisted: boolean | null;
   savedCount: number;
   onTogglePrivate: () => void;
   onBackup: () => Promise<void>;
@@ -13,10 +17,11 @@ interface Props {
 }
 
 /** "Where is my data?" + keep-nothing switch + backup/restore. */
-export function DevicePanel({ privateMode, persistent, savedCount, onTogglePrivate, onBackup, onRestore }: Props) {
+export function DevicePanel({ privateMode, persistent, persisted, savedCount, onTogglePrivate, onBackup, onRestore }: Props) {
   const [usage, setUsage] = useState<{ used: number; quota: number } | null>(null);
   const [busy, setBusy] = useState(false);
   const restoreInput = useRef<HTMLInputElement>(null);
+  const iosSafari = isIOS() && !isStandalone();
 
   useEffect(() => {
     void storageEstimate().then(setUsage);
@@ -26,6 +31,8 @@ export function DevicePanel({ privateMode, persistent, savedCount, onTogglePriva
     setBusy(true);
     try {
       await fn();
+    } catch {
+      // the action shows its own message
     } finally {
       setBusy(false);
     }
@@ -39,8 +46,14 @@ export function DevicePanel({ privateMode, persistent, savedCount, onTogglePriva
       <p className="mt-2 text-sm text-muted flex items-start gap-2">
         <ShieldCheck className="w-4 h-4 mt-0.5 shrink-0 text-live" />
         {privateMode
-          ? 'Nothing is kept on this computer: items disappear when you close this tab.'
-          : 'Everything is stored only on your devices, in this browser. Nothing is stored on any server.'}
+          ? 'Nothing is kept on this computer: closing or reloading this tab clears everything, including the pairing.'
+          : !persistent
+            ? 'This browser won’t let qrLinkShare store anything: items disappear when you reload or close this tab.'
+            : 'Everything is stored only on your devices, in this browser. Nothing is stored on any server.'}
+      </p>
+      <p className="mt-2 text-xs text-muted">
+        To find each other, devices pass a tiny encrypted “here I am” through public relays, and each asks a public address service
+        (Cloudflare’s) for its own internet address. Those services never see what you send.
       </p>
       {!privateMode && usage && usage.used > 0 && (
         <p className="mt-2 text-xs text-muted">
@@ -63,15 +76,25 @@ export function DevicePanel({ privateMode, persistent, savedCount, onTogglePriva
           <span id="private-label" className="block text-sm font-semibold">
             Keep nothing on this computer
           </span>
-          <span className="block text-xs text-muted">For shared or office computers. Nothing is saved after you close the tab.</span>
+          <span className="block text-xs text-muted">For shared or office computers. Nothing is saved once you close or reload the tab.</span>
         </span>
       </label>
 
-      {!privateMode && (
+      {!privateMode && persistent && (
         <div className="mt-4 pt-4 border-t border-line">
+          {iosSafari && (
+            <p className="mb-3 rounded-xl bg-surface-2 p-3 text-xs flex items-start gap-2" role="note">
+              <Info className="w-4 h-4 shrink-0 text-warn" />
+              <span>
+                <b>iPhone / iPad:</b> Safari deletes a website’s data (Saved items and pairing) if you don’t open it for 7 days. To keep
+                them: tap <b>Backup</b>, then <b>Share → Add to Home Screen</b>. Open qrLinkShare from the Home Screen, tap <b>Restore</b>{' '}
+                and pair again there (the Home Screen app starts empty).
+              </span>
+            </p>
+          )}
           <p className="text-xs text-muted">
             Your saved items exist only on your devices. If you clear this browser’s data, they’re gone, so download a backup now and then.
-            {!persistent && ' This browser may clear storage when space runs low.'}
+            {persisted === false && !iosSafari && ' This browser may also clear storage when the device runs low on space.'}
           </p>
           <div className="mt-3 grid grid-cols-2 gap-2">
             <button type="button" className="btn btn-outline text-sm" disabled={busy || savedCount === 0} onClick={() => run(onBackup)}>
@@ -81,10 +104,10 @@ export function DevicePanel({ privateMode, persistent, savedCount, onTogglePriva
               <UploadCloud className="w-4 h-4" /> Restore
             </button>
           </div>
+          {/* No "accept" filter: phone file pickers grey out file types they don't know. */}
           <input
             ref={restoreInput}
             type="file"
-            accept="application/json,.json"
             className="hidden"
             onChange={(e) => {
               const f = e.target.files?.[0];

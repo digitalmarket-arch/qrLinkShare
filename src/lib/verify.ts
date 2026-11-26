@@ -11,10 +11,9 @@ let remoteJwks: JWTVerifyGetKey | null = null;
 
 /**
  * Verifies a Firebase/Google ID token from another device and checks it is for the
- * same account. Google's public keys are fetched from Google (the same keys any
- * server would use). If that fetch is impossible (offline, blocked), we fall back to
- * checking the token's claims: reaching the account room already required knowing
- * the account's private id.
+ * same account. The signature is checked against Google's public keys (fetched from
+ * Google and cached). If they can't be fetched, the check fails: an unchecked token is
+ * never accepted.
  */
 export async function verifyGoogleToken(
   token: string,
@@ -22,27 +21,18 @@ export async function verifyGoogleToken(
   projectId: string,
   opts: { jwks?: JWTVerifyGetKey; now?: number } = {}
 ): Promise<boolean> {
-  if (typeof token !== 'string' || token.length > 4096 || !expectedUid) return false;
-  const { jwtVerify, createRemoteJWKSet, decodeJwt } = await import('jose');
-  const issuer = `https://securetoken.google.com/${projectId}`;
+  if (typeof token !== 'string' || !token || token.length > 4096 || !expectedUid) return false;
   try {
+    const { jwtVerify, createRemoteJWKSet } = await import('jose');
     const keys = opts.jwks ?? (remoteJwks ??= createRemoteJWKSet(new URL(GOOGLE_JWKS_URL)));
     const { payload } = await jwtVerify(token, keys, {
-      issuer,
+      issuer: `https://securetoken.google.com/${projectId}`,
       audience: projectId,
+      algorithms: ['RS256'],
       ...(opts.now ? { currentDate: new Date(opts.now) } : {}),
     });
     return payload.sub === expectedUid;
-  } catch (err) {
-    const code = (err as { code?: string }).code ?? '';
-    const isNetwork = err instanceof TypeError || code === 'ERR_JWKS_TIMEOUT';
-    if (!isNetwork) return false;
-    try {
-      const p = decodeJwt(token);
-      const now = (opts.now ?? Date.now()) / 1000;
-      return p.sub === expectedUid && p.iss === issuer && p.aud === projectId && typeof p.exp === 'number' && p.exp > now;
-    } catch {
-      return false;
-    }
+  } catch {
+    return false;
   }
 }

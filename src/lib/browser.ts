@@ -23,7 +23,7 @@ export function downloadBlob(blob: Blob, name: string) {
   document.body.appendChild(a);
   a.click();
   a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 30_000);
+  setTimeout(() => URL.revokeObjectURL(url), 120_000); // big backups take a while to save
 }
 
 /** Opens a link in a new tab without giving it access to this page. Returns false if blocked. */
@@ -33,4 +33,16 @@ export function openInNewTab(url: string): boolean {
   win.opener = null;
   win.location.href = url;
   return true;
+}
+
+/** iPhone, iPod or iPad (iPads may say they are a Mac). */
+export function isIOS(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  return /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+}
+
+/** Opened from the Home Screen / as an installed app (not in a normal browser tab). */
+export function isStandalone(): boolean {
+  if (typeof window === 'undefined') return false;
+  return (navigator as Navigator & { standalone?: boolean }).standalone === true || matchMedia('(display-mode: standalone)').matches;
 }

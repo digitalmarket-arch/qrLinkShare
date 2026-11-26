@@ -25,7 +25,7 @@ Other ways to connect:
 | **Google** | Sign in with the same Google account on both devices (the first time, confirm a code on both) | Your own devices, no typing |
 | **Web3 wallet** | Connect the same wallet (MetaMask, Trust, Rabby, Coinbase Wallet…) on both | Crypto users, no email needed |
 
-Codes change every 3 minutes, after each use, and after a declined attempt. A code that has expired is refused, even if the screen showing it was left open in the background.
+Codes change every 3 minutes and after each use. A PIN also changes after any attempt that doesn't pair, and a QR code after the other device says no. A code that has expired is refused, even if the screen showing it was left open in the background.
 
 ## Two sections: Temporary and Saved
 
@@ -60,16 +60,21 @@ You can move any temporary item to Saved with the bookmark button.
 
 - Each group of paired devices shares a long random secret. QR codes and PINs are **one-time invitations** valid for 3 minutes; the secret itself is handed over only inside the encrypted device-to-device connection.
 - A QR code carries a long random invitation nobody can guess.
-- A PIN is short, and someone watching the public relays could work out which PIN is in use. That's why PIN pairing shows a **security code** on both screens. The code is made from both devices' ids and from random numbers each device commits to before seeing the other's, so it only matches when the two devices really talk to each other directly. Nothing is shared until you confirm on both. If two devices use the same PIN at the same moment, both are refused and a new code is shown. If the device that typed the PIN gives up, the question disappears by itself.
+- A PIN is short, and someone watching the public relays could work out which PIN is in use. That's why PIN pairing shows a **security code** on both screens. The code is made from both devices' ids and from random numbers each device commits to before seeing the other's, so nobody can choose it: someone trying to sit in between has a 1-in-10,000 chance per attempt of making the two screens match.
+  - Every attempt that doesn't finish uses up the PIN, a new one is shown, and you're told. After three such attempts in 10 minutes, PIN pairing pauses (the QR code keeps working).
+  - If two devices use the same PIN at once, both are refused.
+  - Each device shares its pairing as soon as you confirm on it, so compare the codes before tapping either button.
+  - If the device that typed the PIN gives up, the question disappears by itself.
 - **Unpair** tells your other devices that are online at that moment, so they forget this one. A device that was offline then keeps showing it as "Offline"; remove it there with the **×** (Forget) next to it.
+- **Forget** only removes a device from the list. If that device still has qrLinkShare (a lost phone, say), it reconnects the next time it's opened. To shut a lost or stolen device out, tap **Unpair this device** on each of your other devices, then pair them with each other again, and sign out of Google or the wallet there if you linked one.
 - **Wallet sign-in**: your wallet signs one fixed message (free, no transaction). Only your wallet can make that signature, and it's the same on all your devices, so they meet in a private room nobody else can find, even someone who knows your wallet address. (Use a regular wallet; smart-contract wallets aren't supported.)
 - **Google sign-in** is the convenient option:
   - Your devices meet in a room based on your Google account's internal id.
-  - The first time two of your devices meet, both ask *Is this your device?* and show the same 4-digit security code. Check it and tap **Allow** on both. After that they reconnect by themselves.
-  - Each device also checks the other's Google sign-in token, on the device, against Google's public keys. A device only shows its token to devices you approved.
+  - The first time two of your devices meet, both ask *Is this your device?* and show the same 4-digit security code. Check it and tap **Allow** on both. After that they reconnect by themselves. The code comparison is what protects you; devices that keep starting the check without finishing it pause new connections for 10 minutes.
+  - Each device also checks the other's Google sign-in token, on the device, against Google's public keys. It must come from that device's own sign-in, not be one handed back. A device only shows its token to devices you allowed, so a device you allow receives this device's Google token.
   - Like any Google sign-in, Firebase (Google's sign-in service used here) keeps a sign-in record: your account id, email, name and sign-in times. Nothing you share is stored there.
   - Someone who learns your account's internal id could make your devices show the *Is this your device?* question. If you didn't expect it, tap **Don't allow**.
-  - Google sign-in is turned off in *Keep nothing on this computer* mode, because it would leave the browser signed in to Google for the next person.
+  - Google sign-in is turned off in *Keep nothing on this computer* mode, because it would leave the browser signed in to Google for the next person. Signing out of qrLinkShare doesn't sign the browser out of Google; on a shared computer, also sign out at accounts.google.com.
 - Nothing you share is ever uploaded anywhere (see the Android share note above for the one exception).
 
 ## Run it on your computer

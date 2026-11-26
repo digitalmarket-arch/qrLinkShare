@@ -4,7 +4,7 @@ import { Mesh, type AccountSession, type DeliveryResult, type Receipt, type Rece
 import { isPersisted, openStore, requestPersistentStorage, type Store } from '../lib/db';
 import { accountRoom, randomSecret } from '../lib/pairing';
 import { MAX_FILE_BYTES, MAX_TEXT_CHARS, TEMP_TTL_MS, toHttpUrl } from '../lib/shared';
-import { verifyGoogleToken } from '../lib/verify';
+import { createOwnTokenGuard, verifyGoogleToken } from '../lib/verify';
 import {
   deviceBasics,
   isPrivateMode,
@@ -53,15 +53,24 @@ async function accountSession(
 ): Promise<AccountSession> {
   if (acc.kind === 'google') {
     const projectId = firebaseConfig.projectId;
+    // A device that only hands back one of our own tokens (after a mistaken "Allow") is refused.
+    const own = createOwnTokenGuard();
+    const current = () => import('../lib/firebase').then((fb) => fb.currentIdToken(acc.uid));
+    void current().then((t) => t && own.remember(t)).catch(() => {});
     return {
       kind: 'google',
       room: await accountRoom({ kind: 'google', uid: acc.uid }),
       auth: async () => {
-        const fb = await import('../lib/firebase');
-        const token = await fb.currentIdToken(acc.uid);
-        return token ? { idToken: token } : {};
+        const token = await current();
+        if (!token) return {};
+        await own.remember(token);
+        return { idToken: token };
       },
-      verify: (auth) => verifyGoogleToken(auth?.idToken ?? '', acc.uid, projectId),
+      verify: async (auth) => {
+        const token = auth?.idToken ?? '';
+        if (!token || (await own.isOwn(token))) return false;
+        return verifyGoogleToken(token, acc.uid, projectId);
+      },
       // A device met for the first time is confirmed with a security code on both screens.
       isApproved: hooks.isApproved,
       approve: hooks.approve,
@@ -220,6 +229,8 @@ export function useP2P(handlers: P2PHandlers) {
   const setProgressFor = (id: string, value: number | null) =>
     setProgress((prev) => {
       if (value === null && !(id in prev)) return prev;
+      // Only when the shown percentage changes (a big file reports progress thousands of times).
+      if (value !== null && id in prev && Math.round(prev[id] * 100) === Math.round(value * 100)) return prev;
       const next = { ...prev };
       if (value === null) delete next[id];
       else next[id] = value;
@@ -288,7 +299,9 @@ export function useP2P(handlers: P2PHandlers) {
       if (!stalled) continue;
       lastReceive.current.delete(it.id);
       setProgressFor(it.id, null);
-      await persistIfExists(it.id, (i) => (i.status === 'receiving' ? { ...i, status: 'failed' } : null));
+      // A sender this device no longer knows won't come back to finish it.
+      const gone = !knownRef.current[it.from.id] && !meshRef.current?.devices().some((d) => d.id === it.from.id);
+      await persistIfExists(it.id, (i) => (i.status === 'receiving' ? { ...i, status: 'failed', ...(gone ? { failReason: 'sender-gone' as const } : {}) } : null));
     }
   };
 
@@ -321,8 +334,11 @@ export function useP2P(handlers: P2PHandlers) {
       !(i.deliveredTo ?? []).includes(deviceId) &&
       !i.refusedBy?.[deviceId] &&
       !expired(i);
+    // Items nobody has yet are for whichever device connects first; but an item another device
+    // refused (e.g. no space there) is not pushed to a newly paired device unasked.
+    const firstComer = (i: StoredItem) => i.status === 'pending' && !Object.keys(i.refusedBy ?? {}).length;
     const todo = (await store.list())
-      .filter((i) => waiting(i) && (i.status === 'pending' || Date.parse(i.createdAt) >= since))
+      .filter((i) => waiting(i) && (firstComer(i) || Date.parse(i.createdAt) >= since))
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 
     for (const candidate of todo) {
@@ -562,6 +578,17 @@ export function useP2P(handlers: P2PHandlers) {
         });
       }
       const still = [...new Set([...(knownRef.current[id]?.methods ?? []), ...mesh.linksTo(id)])].filter((m) => m !== method);
+      if (!still.length) {
+        // Anything it was still sending here won't be finished.
+        void (async () => {
+          for (const it of (await storeRef.current?.list()) ?? []) {
+            if (it.status !== 'receiving' || it.from.id !== id) continue;
+            lastReceive.current.delete(it.id);
+            setProgressFor(it.id, null);
+            await persistIfExists(it.id, (i) => (i.status === 'receiving' ? { ...i, status: 'failed', failReason: 'sender-gone' } : null));
+          }
+        })();
+      }
       const now = Date.now();
       if (now - (lastGone.get(`${id}:${method}`) ?? 0) < 5000) return;
       lastGone.set(`${id}:${method}`, now);
@@ -815,6 +842,11 @@ export function useP2P(handlers: P2PHandlers) {
     forgetDevices('paired');
   };
 
+  const deviceNames = useMemo(
+    () => Object.fromEntries([...Object.values(known), ...devices].map((d) => [d.id, d.name])) as Record<string, string>,
+    [known, devices]
+  );
+
   return {
     ready,
     startupError,
@@ -828,7 +860,7 @@ export function useP2P(handlers: P2PHandlers) {
     devices,
     knownDevices: Object.values(known).filter((d) => !devices.some((c) => c.id === d.id)),
     /** Names of devices this one knows (for "couldn't be saved on <name>"). */
-    deviceNames: Object.fromEntries([...Object.values(known), ...devices].map((d) => [d.id, d.name])) as Record<string, string>,
+    deviceNames,
     relay,
     progress,
     account,

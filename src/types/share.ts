@@ -66,7 +66,7 @@ export interface StoredItem extends WireItem {
   /** Devices that couldn't take it, and why (only for items created here). Cleared by "Try again". */
   refusedBy?: Record<string, RefusalReason>;
   /** Why an incoming file failed (when known). */
-  failReason?: 'no-space';
+  failReason?: 'no-space' | 'sender-gone';
 }
 
 /** no-space: the other device is out of storage; refused: it couldn't accept it. */

@@ -65,7 +65,12 @@ export const setPrivateMode = (on: boolean) => write(local(), 'qrls.private', on
 // bring back when a closed tab is reopened. Clear any leftovers.
 if (isPrivateMode()) for (const k of PAIRING_KEYS) write(session(), k, null);
 
-const scoped = (): KV | undefined => (isPrivateMode() ? memory : local());
+/**
+ * A tab that opened in "keep nothing" mode stays memory-only until it reloads, even if another
+ * tab turns the mode off; and any tab switches to memory as soon as the mode is turned on.
+ */
+const STARTED_PRIVATE = isPrivateMode();
+const scoped = (): KV | undefined => (STARTED_PRIVATE || isPrivateMode() ? memory : local());
 
 /* --------------------------------- pairing --------------------------------- */
 

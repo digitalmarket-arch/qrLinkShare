@@ -176,3 +176,16 @@ test('security code: 4 digits, the same on both devices, different for anyone in
   assert.notEqual(await securityCode('pin/654321', phone, laptop), a);
   assert.notEqual(await securityCode('pin/123456', { ...phone, nonce: 'other' }, laptop), a);
 });
+
+test('Google check: a token this device handed out (or from its own sign-in) is not accepted back', async () => {
+  const { createOwnTokenGuard } = await import('./verify');
+  const { privateKey } = await generateKeyPair('RS256');
+  const tok = (authTime: number) =>
+    new SignJWT({ sub: 'user-1', auth_time: authTime }).setProtectedHeader({ alg: 'RS256' }).setIssuedAt().setExpirationTime('1h').sign(privateKey);
+  const guard = createOwnTokenGuard();
+  const mine = await tok(1_700_000_000);
+  await guard.remember(mine);
+  assert.equal(await guard.isOwn(mine), true); // handed straight back
+  assert.equal(await guard.isOwn(await tok(1_700_000_000)), true); // another token of the same sign-in
+  assert.equal(await guard.isOwn(await tok(1_700_000_500)), false); // another device's own sign-in
+});

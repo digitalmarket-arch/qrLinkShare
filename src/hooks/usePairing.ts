@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { DeviceInfo } from '../types/share';
-import type { Mesh } from '../lib/mesh';
+import type { Mesh, SpentReason } from '../lib/mesh';
 import { inviteLink, randomPin, randomSecret } from '../lib/pairing';
 
 export const CODE_TTL_MS = 3 * 60 * 1000;
@@ -12,6 +12,10 @@ interface Code {
 }
 
 const freshCode = (): Code => ({ invite: randomSecret(18), pin: randomPin(), expiresAt: Date.now() + CODE_TTL_MS });
+
+/** After this many PIN attempts that didn't pair (in 10 minutes), PIN pairing pauses; the QR code keeps working. */
+const MAX_PIN_STRIKES = 3;
+const STRIKE_WINDOW_MS = 10 * 60_000;
 const linkFor = (c: Code) => inviteLink(c.invite, { origin: location.origin, pathname: location.pathname });
 
 /**
@@ -28,8 +32,8 @@ export function usePairing(opts: {
   onKnock: (device: DeviceInfo, code: string, signal: AbortSignal) => Promise<boolean>;
   onAdopt: (secret: string, device: DeviceInfo) => Promise<void>;
   onPaired: (device: DeviceInfo, via: 'qr' | 'pin') => void;
-  /** Two devices used the same PIN at once (the code was replaced for safety). */
-  onCollision: () => void;
+  /** An attempt didn't pair and the code was replaced (to tell the person why). */
+  onSpent: (reason: SpentReason, paused: boolean) => void;
 }) {
   const { mesh, enabled } = opts;
   const [code, setCode] = useState<Code>(freshCode);
@@ -38,6 +42,9 @@ export function usePairing(opts: {
   handlers.current = opts;
   /** While someone is deciding whether to allow a device, the code isn't replaced. */
   const knocking = useRef(0);
+  /** PIN attempts that didn't pair; kept across code changes. */
+  const strikes = useRef<number[]>([]);
+  const [pinPaused, setPinPaused] = useState(false);
 
   /** Replaces the code; returns the new pairing link. */
   const refresh = useCallback(() => {
@@ -49,7 +56,7 @@ export function usePairing(opts: {
   // Listen for new devices using the current code.
   useEffect(() => {
     if (!mesh || !enabled) return;
-    const stop = mesh.host(code, {
+    const stop = mesh.host({ ...code, pin: pinPaused ? null : code.pin }, {
       groupSecret: () => handlers.current.groupSecret,
       hasPaired: () => handlers.current.hasPaired(),
       onKnock: async (d, sasCode, signal) => {
@@ -66,12 +73,22 @@ export function usePairing(opts: {
         refresh(); // each code works once
       },
       onSpent: (reason) => {
-        if (reason === 'collision') handlers.current.onCollision();
+        let paused = false;
+        if (reason !== 'left') {
+          const now = Date.now();
+          strikes.current = [...strikes.current.filter((t) => now - t < STRIKE_WINDOW_MS), now];
+          if (strikes.current.length >= MAX_PIN_STRIKES) {
+            strikes.current = [];
+            paused = true;
+            setPinPaused(true);
+          }
+        }
+        handlers.current.onSpent(reason, paused);
         refresh();
       },
     });
     return stop;
-  }, [mesh, enabled, code, refresh]);
+  }, [mesh, enabled, code, refresh, pinPaused]);
 
   // Countdown, and a new code when time is up (also in a background tab).
   useEffect(() => {
@@ -93,6 +110,12 @@ export function usePairing(opts: {
   const msLeft = Math.max(0, code.expiresAt - now);
   return {
     pin: code.pin,
+    /** PIN pairing is paused after repeated unfinished attempts (QR still works). */
+    pinPaused,
+    resumePin: () => {
+      setPinPaused(false);
+      refresh();
+    },
     link: linkFor(code),
     secondsLeft: Math.ceil(msLeft / 1000),
     fractionLeft: msLeft / CODE_TTL_MS,

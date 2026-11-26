@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useState } from 'react';
 import { CameraOff, ChevronDown, Copy, KeyRound, Loader2, QrCode as QrIcon, RefreshCw, ScanLine, Wallet } from 'lucide-react';
 import type { Account, DeviceInfo } from '../types/share';
-import type { Mesh } from '../lib/mesh';
+import type { Mesh, SpentReason } from '../lib/mesh';
 import { formatPin } from '../lib/shared';
 import { copyText } from '../lib/browser';
 import { usePairing } from '../hooks/usePairing';
@@ -58,7 +58,8 @@ interface Props {
   onKnock: (device: DeviceInfo, code: string, signal: AbortSignal) => Promise<boolean>;
   onAdopt: (secret: string, device: DeviceInfo) => Promise<void>;
   onPaired: (device: DeviceInfo, via: 'qr' | 'pin') => void;
-  onCollision: () => void;
+  /** A pairing attempt didn't pair and the code was replaced; `paused`: PIN pairing is now paused. */
+  onSpent: (reason: SpentReason, paused: boolean) => void;
   onEnterPin: (pin: string) => void;
   onScanned: (text: string) => void;
   onGoogle: () => void;
@@ -92,7 +93,7 @@ export function ConnectPanel(props: Props) {
     onKnock: props.onKnock,
     onAdopt: props.onAdopt,
     onPaired: props.onPaired,
-    onCollision: props.onCollision,
+    onSpent: props.onSpent,
   });
 
   const tabs: Array<{ id: Tab; label: string; icon: typeof QrIcon }> = [
@@ -179,10 +180,24 @@ export function ConnectPanel(props: Props) {
             {tab === 'show' && (
               <div className="flex flex-col items-center text-center">
                 <QrCode value={pairing.link} size={isMobile ? 200 : 232} label="QR code to pair another device" />
-                <p className="mt-5 text-xs font-semibold uppercase tracking-wider text-muted">or enter this PIN</p>
-                <p className="mt-1 font-mono text-4xl font-semibold tracking-[0.12em] tabular-nums" aria-live="polite">
-                  {formatPin(pairing.pin)}
-                </p>
+                {pairing.pinPaused ? (
+                  <div className="mt-5 rounded-xl bg-surface-2 p-3 text-sm text-left" role="status">
+                    <p>
+                      <b>PIN pairing is paused.</b> A device kept entering this computer’s PIN without finishing. Use the QR code, or show
+                      a PIN again when you’re ready.
+                    </p>
+                    <button type="button" className="btn btn-outline text-sm mt-3" onClick={pairing.resumePin}>
+                      Show a PIN again
+                    </button>
+                  </div>
+                ) : (
+                  <>
+                    <p className="mt-5 text-xs font-semibold uppercase tracking-wider text-muted">or enter this PIN</p>
+                    <p className="mt-1 font-mono text-4xl font-semibold tracking-[0.12em] tabular-nums" aria-live="polite">
+                      {formatPin(pairing.pin)}
+                    </p>
+                  </>
+                )}
                 <div className="mt-4 w-full max-w-60">
                   <div className="h-1 rounded-full bg-surface-2 overflow-hidden">
                     <div

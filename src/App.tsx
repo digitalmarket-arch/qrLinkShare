@@ -11,7 +11,7 @@ import { createBackup, restoreBackup } from './lib/backup';
 import { unlockWalletRoom, walletErrorMessage, type WalletOption } from './lib/wallet';
 import { extractLinks } from './lib/linkify';
 import { takeSharedText } from './lib/shareTarget';
-import type { JoinStatus } from './lib/mesh';
+import type { JoinStatus, SpentReason } from './lib/mesh';
 import { useP2P, type IncomingNotice } from './hooks/useP2P';
 import { ToastProvider, useToast } from './components/Toasts';
 import { Header, Logo, type Theme } from './components/Header';
@@ -39,8 +39,9 @@ async function clearFirebaseTraces() {
   } catch {
     // storage blocked
   }
-  await deleteNamedDatabase('firebaseLocalStorageDb');
-  await deleteNamedDatabase('firebase-heartbeat-database');
+  // This page may still hold them open; the deletion then finishes when it reloads.
+  await deleteNamedDatabase('firebaseLocalStorageDb', { waitIfBlocked: false });
+  await deleteNamedDatabase('firebase-heartbeat-database', { waitIfBlocked: false });
 }
 
 const METHOD_NAME: Record<LinkMethod, string> = { paired: 'QR / PIN pairing', google: 'Google', wallet: 'the wallet' };
@@ -240,10 +241,14 @@ function Shell() {
         ...p2p.knownDevices.filter((d) => d.methods.includes('paired')),
       ].map((d) => d.name);
       const othersText = others.length ? others.slice(0, 3).join(', ') + (others.length > 3 ? '…' : '') : 'your other paired devices';
+      // Own items still waiting to be sent: a newly paired device would get them.
+      const waiting = p2p.items.filter((i) => i.from.id === p2p.self.id && i.status === 'pending').length;
+      const waitingText = waiting ? ` It will also get the ${waiting === 1 ? 'item' : `${waiting} items`} waiting on this device.` : '';
       try {
         const res = await mesh.joinWith(code, {
           mySecret: p2p.currentGroup,
           paired: p2p.hasPaired(),
+          waiting,
           signal: abort.signal,
           onStatus: (st) => live() && setJoining((j) => ({ ...(j ?? {}), text: label[st] })),
           confirm: ({ code: sas, host, merge }) =>
@@ -259,9 +264,10 @@ function Shell() {
                   text: 'Found it. Compare this code with the other screen.',
                   code: sas,
                   ask: {
-                    question: merge
-                      ? `Does the other device show this same code? Pairing also connects it to ${othersText}.`
-                      : 'Does the other device show this same code?',
+                    question:
+                      (merge
+                        ? `Does the other device show this same code? Pairing also connects it to ${othersText}.`
+                        : 'Does the other device show this same code?') + waitingText,
                     yes: 'It matches',
                     onAnswer,
                   },
@@ -269,7 +275,11 @@ function Shell() {
               } else {
                 setJoining({
                   text: `Pair with ${host?.name ?? 'this device'}?`,
-                  ask: { question: `${othersText} will connect to it too.`, yes: 'Pair', onAnswer },
+                  ask: {
+                    question: (merge ? `${othersText} will connect to it too.` : 'It will get everything you send from now on.') + waitingText,
+                    yes: 'Pair',
+                    onAnswer,
+                  },
                 });
               }
             }),
@@ -289,7 +299,7 @@ function Shell() {
         }
       }
     },
-    [p2p.mesh, p2p.currentGroup, p2p.hasPaired, p2p.joinGroup, p2p.devices, p2p.knownDevices, toast]
+    [p2p.mesh, p2p.currentGroup, p2p.hasPaired, p2p.joinGroup, p2p.devices, p2p.knownDevices, p2p.items, p2p.self.id, toast]
   );
   const joinRef = useRef(join);
   joinRef.current = join;
@@ -321,12 +331,21 @@ function Shell() {
   /** This device had no paired devices and the new one did: join the new one's group. */
   const onAdopt = useCallback((secret: string) => p2p.adoptGroup(secret), [p2p.adoptGroup]);
 
-  const onCollision = useCallback(
-    () =>
-      toast(
-        { tone: 'error', title: 'Two devices used this PIN at once', body: 'For safety a new code is shown. Try again with the new PIN.' },
-        8000
-      ),
+  /** A pairing attempt didn't pair and the code was replaced: say why (some of these can be someone else trying). */
+  const onSpent = useCallback(
+    (reason: SpentReason, paused: boolean) => {
+      const body: Partial<Record<SpentReason, string>> = {
+        collision: 'Two devices used this PIN at the same time. For safety a new code is shown; try again with it.',
+        unfinished: 'A device entered this PIN but didn’t finish. Nothing was connected, and a new PIN is shown.',
+        blocked: 'A device joined with this PIN but didn’t continue. For safety a new PIN is shown.',
+      };
+      const text = body[reason];
+      if (paused) {
+        toast({ tone: 'error', title: 'PIN pairing paused', body: 'A device kept entering this PIN without finishing. Use the QR code, or show a PIN again when ready.' }, 10000);
+      } else if (text) {
+        toast({ tone: 'info', title: reason === 'collision' ? 'Two devices used this PIN at once' : 'New PIN', body: text }, 8000);
+      }
+    },
     [toast]
   );
 
@@ -422,18 +441,33 @@ function Shell() {
     const wasGoogle = p2p.account?.kind === 'google';
     await p2p.leaveAccount().catch(() => {});
     if (wasGoogle) await loadFirebase().then((fb) => fb.signOutGoogle()).catch(() => {});
-    toast({ tone: 'info', title: 'Signed out', body: 'Devices paired by QR code or PIN stay connected.' });
+    toast(
+      {
+        tone: 'info',
+        title: 'Signed out',
+        body: wasGoogle
+          ? 'Devices paired by QR code or PIN stay connected. This browser may still be signed in to Google itself: on a shared computer, also sign out at accounts.google.com.'
+          : 'Devices paired by QR code or PIN stay connected.',
+      },
+      wasGoogle ? 9000 : 5000
+    );
   };
 
   /* ------------------------------- this device ------------------------------- */
 
   const togglePrivate = async () => {
     if (!p2p.privateMode) {
-      if (!confirm('Keep nothing on this computer?\n\nThis deletes everything qrLinkShare stored in this browser (items, pairing and this device’s identity) and reloads. From now on nothing is kept after the tab closes or reloads.')) return;
+      const google = p2p.account?.kind === 'google' || !!firebasePromise;
+      if (
+        !confirm(
+          'Keep nothing on this computer?\n\nThis deletes everything qrLinkShare stored in this browser (items, pairing and this device’s identity) and reloads. From now on nothing is kept after the tab closes or reloads.' +
+            (google
+              ? '\n\nThis browser may still be signed in to Google itself (qrLinkShare can’t sign you out of Google). Before you leave this computer, sign out at accounts.google.com.'
+              : '')
+        )
+      )
+        return;
       try {
-        // Google: sign out (best effort) and remove what it saved in this browser.
-        if (p2p.account?.kind === 'google') await loadFirebase().then((fb) => fb.signOutGoogle()).catch(() => {});
-        await clearFirebaseTraces();
         // Tell the other devices to forget this one: it is about to become a different device.
         await p2p.mesh.current?.sayBye('group').catch(() => {});
         await p2p.mesh.current?.sayBye('account').catch(() => {});
@@ -443,6 +477,11 @@ function Shell() {
         await p2p.mesh.current?.destroy();
         await clearUserIdentity(APP_ID).catch(() => {});
         await deleteDatabase();
+        // Google last (it may need to download its code): sign out, briefly, then remove what it saved.
+        if (google) {
+          await Promise.race([loadFirebase().then((fb) => fb.signOutGoogle()), new Promise((r) => setTimeout(r, 1500))]).catch(() => {});
+          await clearFirebaseTraces();
+        }
       } finally {
         location.reload();
       }
@@ -481,14 +520,19 @@ function Shell() {
 
   /* --------------------------------- items --------------------------------- */
 
-  const copy = (text: string, what: string) => {
-    copyText(text)
-      .then(() => toast({ tone: 'success', title: `${what} copied` }, 2000))
-      .catch(() => toast({ tone: 'error', title: 'Copy failed', body: 'Your browser blocked clipboard access.' }));
-  };
+  const copy = useCallback(
+    (text: string, what: string) => {
+      copyText(text)
+        .then(() => toast({ tone: 'success', title: `${what} copied` }, 2000))
+        .catch(() => toast({ tone: 'error', title: 'Copy failed', body: 'Your browser blocked clipboard access.' }));
+    },
+    [toast]
+  );
 
-  const keep = async (item: StoredItem) => {
-    await p2p.keepForever(item.id);
+  const keepForeverRef = useRef(p2p.keepForever);
+  keepForeverRef.current = p2p.keepForever;
+  const keep = useCallback(async (item: StoredItem) => {
+    await keepForeverRef.current(item.id);
     toast(
       {
         tone: 'success',
@@ -499,7 +543,14 @@ function Shell() {
       },
       4000
     );
-  };
+  }, [toast]);
+
+  const removeRef = useRef(p2p.remove);
+  removeRef.current = p2p.remove;
+  const retryRef = useRef(p2p.retry);
+  retryRef.current = p2p.retry;
+  const onDeleteItem = useCallback((item: StoredItem) => void removeRef.current(item.id), []);
+  const onRetryItem = useCallback(() => void retryRef.current(), []);
 
   const clear = (retention: Retention) => void p2p.removeAll(retention);
 
@@ -576,7 +627,7 @@ function Shell() {
               onKnock={onKnock}
               onAdopt={onAdopt}
               onPaired={onPaired}
-              onCollision={onCollision}
+              onSpent={onSpent}
               onEnterPin={onEnterPin}
               onScanned={onScanned}
               onGoogle={signInGoogle}
@@ -605,8 +656,8 @@ function Shell() {
               onCopy={copy}
               onShowQr={setQrItem}
               onKeep={keep}
-              onDelete={(item) => void p2p.remove(item.id)}
-              onRetry={() => p2p.retry()}
+              onDelete={onDeleteItem}
+              onRetry={onRetryItem}
               onClear={clear}
               onProblem={problem}
             />
@@ -619,7 +670,11 @@ function Shell() {
               offline={p2p.knownDevices}
               onUnpair={unpair}
               onForget={(d) => {
-                if (confirm(`Forget ${d.name}? Use this for a device that was reset or is gone for good. It won't be sent anything any more.`)) {
+                if (
+                  confirm(
+                    `Forget ${d.name}? It's removed from this list. If it was reset, that's all you need.\n\nIf it still has qrLinkShare (a lost phone, say), it reconnects the next time it's opened there. To shut it out, tap “Unpair this device” on each of your other devices, then pair them with each other again (and sign out of Google or the wallet there if you linked one).`
+                  )
+                ) {
                   p2p.forgetDevice(d.id);
                 }
               }}

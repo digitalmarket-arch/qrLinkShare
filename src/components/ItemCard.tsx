@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, memo, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Archive,
@@ -70,7 +70,8 @@ interface Props {
   onProblem: (message: string) => void;
 }
 
-export function ItemCard({
+/** One item card. Memoised: the feed re-renders often (progress), cards only when their own data changes. */
+export const ItemCard = memo(function ItemCard({
   item,
   myDeviceId,
   fresh,
@@ -296,7 +297,9 @@ export function ItemCard({
               <AlertTriangle className="w-3.5 h-3.5 mt-px shrink-0" />
               {item.failReason === 'no-space'
                 ? `Not enough space on this device to save it. Free up space, then ask ${item.from.name} to tap Try again.`
-                : `Transfer interrupted. It’s sent again automatically when ${item.from.name} is back online.`}
+                : item.failReason === 'sender-gone'
+                  ? `Not received: ${item.from.name} disconnected from this device before it finished. Ask for it again if you still need it.`
+                  : `Transfer interrupted. It’s sent again automatically when ${item.from.name} is back online.`}
             </p>
           )}
           {pct !== null && (
@@ -362,4 +365,4 @@ export function ItemCard({
       </div>
     </li>
   );
-}
+});

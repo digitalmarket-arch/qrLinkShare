@@ -39,6 +39,8 @@ const ASSETS = new URL('./assets/', self.location).pathname;
 // Kept in this version's copy while older copies wait to be deleted:
 // { older: their cache names, windows: ids of the app's windows open when this version took over }.
 const WAITING = new URL('./__older-copies', self.location).href;
+// Marks a copy whose worker took over (so the next version knows which copy was in use).
+const ACTIVATED = new URL('./__activated', self.location).href;
 
 self.addEventListener('install', (event) => {
   event.waitUntil(saveMissing(true).then(() => self.skipWaiting()));
@@ -48,12 +50,36 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(
     (async () => {
       try {
+        const mine = await caches.open(CACHE);
+        await mine.put(ACTIVATED, new Response('1'));
         // Older copies, including the old 'qrls-app-v1' (never the shared text in 'qrls-share').
         const older = (await caches.keys()).filter((k) => k.startsWith(COPY) && k !== CACHE);
         if (older.length) {
-          const windows = (await appWindows()).map((w) => w.id);
-          if (!windows.length) await deleteCopies(older);
-          else await (await caches.open(CACHE)).put(WAITING, new Response(JSON.stringify({ older, windows })));
+          const open = (await appWindows()).map((w) => w.id);
+          // The copy in use until now: the newest older copy whose worker took over.
+          let prev = null;
+          for (const name of [...older].reverse()) {
+            if (await caches.match(ACTIVATED, { cacheName: name })) {
+              prev = name;
+              break;
+            }
+          }
+          prev ??= older[older.length - 1];
+          const prevNote = await caches.match(WAITING, { cacheName: prev }).then((r) => (r ? r.json() : null)).catch(() => null);
+          // Which windows each even older copy is kept for (an older worker's note: one list for all).
+          const prevNeed = prevNote?.need ?? Object.fromEntries((prevNote?.older ?? []).map((n) => [n, prevNote.windows ?? []]));
+          const need = {};
+          const covered = new Set();
+          for (const [name, ids] of Object.entries(prevNeed)) {
+            if (!older.includes(name) || name === prev) continue;
+            need[name] = ids.filter((id) => open.includes(id));
+            for (const id of need[name]) covered.add(id);
+          }
+          // Open windows that don't run an even older version run the previous one.
+          need[prev] = open.filter((id) => !covered.has(id));
+          for (const name of older) need[name] ??= [];
+          await mine.put(WAITING, new Response(JSON.stringify({ need })));
+          await deleteOlderCopies(open);
         }
       } catch {
         // Storage unavailable: nothing to clean up.
@@ -105,12 +131,17 @@ async function keepShared(url) {
 async function page(event) {
   try {
     const res = await fetch(event.request);
-    if (res.status >= 500) return (await saved('./')) || res;
+    if (res.status >= 500) return (await savedPage()) || res;
     if (res.ok && (res.headers.get('Content-Type') || '').includes('text/html')) save(event, './', res.clone());
     return res;
   } catch {
-    return (await saved('./')) || Response.error();
+    return (await savedPage()) || Response.error();
   }
+}
+
+/** The saved page: this version's copy, else an older copy (this one may still lack it). */
+async function savedPage() {
+  return (await saved('./')) || (await fromOtherCopy('./'));
 }
 
 /**
@@ -228,17 +259,29 @@ function tidy() {
 }
 
 /** True when no older copy is left waiting. */
-async function deleteOlderCopies() {
-  const note = await caches.match(WAITING, { cacheName: CACHE });
+async function deleteOlderCopies(openNow) {
+  const cache = await caches.open(CACHE);
+  const note = await cache.match(WAITING);
   if (!note) return true;
   // A newer version is being installed: it takes over the cleanup (and its copy may well have
   // the name of one we'd delete, if the app went back to an earlier build).
   if (self.registration.installing || self.registration.waiting) return false;
-  const { older, windows } = await note.json();
-  const open = new Set((await appWindows()).map((w) => w.id));
-  if (windows.some((id) => open.has(id))) return false;
-  await deleteCopies(older);
-  await (await caches.open(CACHE)).delete(WAITING);
+  // Until this copy has every file, an older copy may be the only place one of them is.
+  const have = new Set((await cache.keys()).map((r) => r.url));
+  if (PRECACHE.some((u) => !have.has(new URL(u, self.location).href))) return false;
+  const { need } = await note.json();
+  const open = new Set(openNow ?? (await appWindows()).map((w) => w.id));
+  const left = {};
+  for (const [name, ids] of Object.entries(need ?? {})) {
+    const still = ids.filter((id) => open.has(id));
+    if (still.length) left[name] = still;
+    else await deleteCopies([name]);
+  }
+  if (Object.keys(left).length) {
+    await cache.put(WAITING, new Response(JSON.stringify({ need: left })));
+    return false;
+  }
+  await cache.delete(WAITING);
   return true;
 }
 

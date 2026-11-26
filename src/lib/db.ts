@@ -195,8 +195,12 @@ export function deleteDatabase(): Promise<void> {
   return deleteNamedDatabase(DB_NAME);
 }
 
-/** Deletes one IndexedDB database by name; waits up to a few seconds if another tab still has it open. */
-export function deleteNamedDatabase(name: string): Promise<void> {
+/**
+ * Deletes one IndexedDB database by name. If it is still open somewhere, the deletion is
+ * queued and finishes once it's closed; by default this waits up to a few seconds for that.
+ */
+export function deleteNamedDatabase(name: string, opts: { waitIfBlocked?: boolean } = {}): Promise<void> {
+  const { waitIfBlocked = true } = opts;
   return new Promise((resolve) => {
     try {
       if (typeof indexedDB === 'undefined') return resolve();
@@ -206,6 +210,12 @@ export function deleteNamedDatabase(name: string): Promise<void> {
         clearTimeout(timer);
         resolve();
       };
+      if (!waitIfBlocked) {
+        req.onblocked = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+      }
     } catch {
       resolve();
     }

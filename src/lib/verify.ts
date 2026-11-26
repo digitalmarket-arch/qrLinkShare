@@ -41,3 +41,36 @@ export async function verifyGoogleToken(
 export async function preloadVerifier(): Promise<void> {
   await import('jose');
 }
+
+/** When the token's sign-in happened (seconds), or null if it can't be read. Not a check by itself. */
+export async function tokenAuthTime(token: string): Promise<number | null> {
+  try {
+    const { decodeJwt } = await import('jose');
+    const t = decodeJwt(token).auth_time;
+    return typeof t === 'number' ? t : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Remembers the sign-in tokens this device handed out. A device that presents one of them (or
+ * any token from this device's own sign-in) only got it from us, e.g. after a mistaken "Allow":
+ * it isn't signed in itself.
+ */
+export function createOwnTokenGuard() {
+  const issued = new Set<string>();
+  const signIns = new Set<number>();
+  return {
+    async remember(token: string) {
+      issued.add(token);
+      const t = await tokenAuthTime(token);
+      if (t !== null) signIns.add(t);
+    },
+    async isOwn(token: string) {
+      if (issued.has(token)) return true;
+      const t = await tokenAuthTime(token);
+      return t !== null && signIns.has(t);
+    },
+  };
+}

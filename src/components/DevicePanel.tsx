@@ -11,7 +11,7 @@ interface Props {
   /** The browser promised not to clear our data (null: unknown). */
   persisted: boolean | null;
   savedCount: number;
-  onTogglePrivate: () => void;
+  onTogglePrivate: () => Promise<void>;
   onBackup: () => Promise<void>;
   onRestore: (file: File) => Promise<void>;
 }
@@ -68,14 +68,15 @@ export function DevicePanel({ privateMode, persistent, persisted, savedCount, on
           role="switch"
           aria-checked={privateMode}
           aria-labelledby="private-label"
-          onClick={onTogglePrivate}
+          disabled={busy}
+          onClick={() => run(onTogglePrivate)}
           className={`relative mt-0.5 w-10 h-6 shrink-0 rounded-full transition-colors cursor-pointer ${privateMode ? 'bg-brand' : 'bg-line'}`}
         >
           <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform ${privateMode ? 'translate-x-4' : ''}`} />
         </button>
         <span>
           <span id="private-label" className="block text-sm font-semibold">
-            Keep nothing on this computer
+            Keep nothing on this computer{busy && !privateMode ? ' (deleting…)' : ''}
           </span>
           <span className="block text-xs text-muted">For shared or office computers. Nothing is saved once you close or reload the tab.</span>
         </span>

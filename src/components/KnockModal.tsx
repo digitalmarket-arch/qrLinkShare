@@ -30,7 +30,7 @@ export function KnockModal({ knock, onAnswer }: { knock: Knock | null; onAnswer:
             </span>
             <div className="min-w-0">
               <p className="font-semibold truncate">{device.name}</p>
-              <p className="text-sm text-muted">{account ? 'is signed in to your Google account' : 'entered your PIN'}</p>
+              <p className="text-sm text-muted">{account ? 'wants to connect as one of your Google devices' : 'entered your PIN'}</p>
             </div>
           </div>
           <div className="mt-4 rounded-2xl border border-line p-4 text-center">

@@ -57,6 +57,10 @@ interface Props {
   fresh: boolean;
   /** 0..1 while this item is being sent or received. */
   progress?: number;
+  /** Some device is connected right now (so a waiting item is about to go out). */
+  online: boolean;
+  /** Names of known devices, for "couldn't be saved on <name>". */
+  deviceNames: Record<string, string>;
   getBlob: (id: string) => Promise<Blob | undefined>;
   onCopy: (text: string, what: string) => void;
   onShowQr: (item: StoredItem) => void;
@@ -66,12 +70,28 @@ interface Props {
   onProblem: (message: string) => void;
 }
 
-export function ItemCard({ item, myDeviceId, fresh, progress, getBlob, onCopy, onShowQr, onKeep, onDelete, onRetry, onProblem }: Props) {
+export function ItemCard({
+  item,
+  myDeviceId,
+  fresh,
+  progress,
+  online,
+  deviceNames,
+  getBlob,
+  onCopy,
+  onShowQr,
+  onKeep,
+  onDelete,
+  onRetry,
+  onProblem,
+}: Props) {
   const [expanded, setExpanded] = useState(false);
   const [thumb, setThumb] = useState<string | null>(null);
   const mine = item.from.id === myDeviceId;
   const DeviceIcon = DEVICE_ICONS[item.from.type] ?? Monitor;
   const available = item.status === 'ready' || item.status === 'pending';
+  /** Devices that couldn't take this item (own items only), e.g. because their storage is full. */
+  const refusals = mine ? Object.entries(item.refusedBy ?? {}).filter(([id]) => !(item.deliveredTo ?? []).includes(id)) : [];
 
   const kind = item.file ? fileKindOf(item.file.mime, item.file.name) : null;
   const isImage = kind === 'image' && !!item.file && /^image\/(png|jpeg|gif|webp|avif|bmp)$/i.test(item.file.mime);
@@ -256,14 +276,27 @@ export function ItemCard({ item, myDeviceId, fresh, progress, getBlob, onCopy, o
             )}
           </p>
 
-          {item.status === 'pending' && mine && pct === null && (
-            <p className="mt-1.5 text-xs font-semibold text-warn">Waiting to send. It goes out when one of your devices connects.</p>
+          {item.status === 'pending' && mine && pct === null && !refusals.length && (
+            <p className={`mt-1.5 text-xs font-semibold ${online ? 'text-brand' : 'text-warn'}`}>
+              {online ? 'Sending…' : 'Waiting to send. It goes out when one of your devices connects.'}
+            </p>
           )}
+          {refusals.map(([id, reason]) => (
+            <p key={id} className="mt-1.5 text-xs font-semibold text-danger flex items-start gap-1">
+              <AlertTriangle className="w-3.5 h-3.5 mt-px shrink-0" />
+              {reason === 'no-space'
+                ? `Couldn’t be saved on ${deviceNames[id] ?? 'the other device'}: not enough space there. Free up space, then tap Try again.`
+                : `${deviceNames[id] ?? 'The other device'} couldn’t accept this.`}
+            </p>
+          ))}
           {item.status === 'receiving' && <p className="mt-1.5 text-xs font-semibold text-brand">Receiving{pct !== null ? ` ${pct}%` : '…'}</p>}
           {item.status === 'pending' && pct !== null && <p className="mt-1.5 text-xs font-semibold text-brand">Sending {pct}%</p>}
           {item.status === 'failed' && (
-            <p className="mt-1.5 text-xs font-semibold text-danger inline-flex items-center gap-1">
-              <AlertTriangle className="w-3.5 h-3.5" /> Transfer interrupted. It’s sent again automatically when {item.from.name} is back online.
+            <p className="mt-1.5 text-xs font-semibold text-danger flex items-start gap-1">
+              <AlertTriangle className="w-3.5 h-3.5 mt-px shrink-0" />
+              {item.failReason === 'no-space'
+                ? `Not enough space on this device to save it. Free up space, then ask ${item.from.name} to tap Try again.`
+                : `Transfer interrupted. It’s sent again automatically when ${item.from.name} is back online.`}
             </p>
           )}
           {pct !== null && (
@@ -303,7 +336,7 @@ export function ItemCard({ item, myDeviceId, fresh, progress, getBlob, onCopy, o
             <Bookmark className="w-4 h-4" />
           </button>
         )}
-        {item.status === 'pending' && mine && pct === null && (
+        {mine && pct === null && (item.status === 'pending' || refusals.length > 0) && (
           <button type="button" className="icon-btn" aria-label="Try sending again" title="Try again" onClick={() => onRetry(item)}>
             <RotateCw className="w-4 h-4" />
           </button>

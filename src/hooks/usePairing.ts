@@ -3,7 +3,7 @@ import type { DeviceInfo } from '../types/share';
 import type { Mesh } from '../lib/mesh';
 import { inviteLink, randomPin, randomSecret } from '../lib/pairing';
 
-const CODE_TTL_MS = 3 * 60 * 1000;
+export const CODE_TTL_MS = 3 * 60 * 1000;
 
 interface Code {
   invite: string;
@@ -12,21 +12,24 @@ interface Code {
 }
 
 const freshCode = (): Code => ({ invite: randomSecret(18), pin: randomPin(), expiresAt: Date.now() + CODE_TTL_MS });
+const linkFor = (c: Code) => inviteLink(c.invite, { origin: location.origin, pathname: location.pathname });
 
 /**
  * While `enabled`, shows a one-time QR invitation + 6-digit PIN for this device and
- * listens for a new device using either. Codes change every 3 minutes and after each
- * use. The 3-minute limit is enforced when a device arrives, so it also holds while
- * this tab is in the background.
+ * listens for a new device using either. Codes change every 3 minutes, after each use,
+ * and after a declined or abandoned attempt. The 3-minute limit is enforced when a
+ * device arrives, so it also holds while this tab is in the background.
  */
 export function usePairing(opts: {
   mesh: Mesh | null;
   enabled: boolean;
   groupSecret: string;
   hasPaired: () => boolean;
-  onKnock: (device: DeviceInfo, signal: AbortSignal) => Promise<boolean>;
+  onKnock: (device: DeviceInfo, code: string, signal: AbortSignal) => Promise<boolean>;
   onAdopt: (secret: string, device: DeviceInfo) => Promise<void>;
   onPaired: (device: DeviceInfo, via: 'qr' | 'pin') => void;
+  /** Two devices used the same PIN at once (the code was replaced for safety). */
+  onCollision: () => void;
 }) {
   const { mesh, enabled } = opts;
   const [code, setCode] = useState<Code>(freshCode);
@@ -36,7 +39,12 @@ export function usePairing(opts: {
   /** While someone is deciding whether to allow a device, the code isn't replaced. */
   const knocking = useRef(0);
 
-  const refresh = useCallback(() => setCode(freshCode()), []);
+  /** Replaces the code; returns the new pairing link. */
+  const refresh = useCallback(() => {
+    const next = freshCode();
+    setCode(next);
+    return linkFor(next);
+  }, []);
 
   // Listen for new devices using the current code.
   useEffect(() => {
@@ -44,10 +52,10 @@ export function usePairing(opts: {
     const stop = mesh.host(code, {
       groupSecret: () => handlers.current.groupSecret,
       hasPaired: () => handlers.current.hasPaired(),
-      onKnock: async (d, signal) => {
+      onKnock: async (d, sasCode, signal) => {
         knocking.current++;
         try {
-          return await handlers.current.onKnock(d, signal);
+          return await handlers.current.onKnock(d, sasCode, signal);
         } finally {
           knocking.current--;
         }
@@ -56,6 +64,10 @@ export function usePairing(opts: {
       onPaired: (d, via) => {
         handlers.current.onPaired(d, via);
         refresh(); // each code works once
+      },
+      onSpent: (reason) => {
+        if (reason === 'collision') handlers.current.onCollision();
+        refresh();
       },
     });
     return stop;
@@ -81,7 +93,7 @@ export function usePairing(opts: {
   const msLeft = Math.max(0, code.expiresAt - now);
   return {
     pin: code.pin,
-    link: inviteLink(code.invite, { origin: location.origin, pathname: location.pathname }),
+    link: linkFor(code),
     secondsLeft: Math.ceil(msLeft / 1000),
     fractionLeft: msLeft / CODE_TTL_MS,
     refresh,

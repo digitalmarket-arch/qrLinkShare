@@ -5,6 +5,7 @@ import type { Mesh } from '../lib/mesh';
 import { formatPin } from '../lib/shared';
 import { copyText } from '../lib/browser';
 import { usePairing } from '../hooks/usePairing';
+import { formatCode } from './KnockModal';
 import { QrCode } from './QrCode';
 import { PinInput } from './PinInput';
 import { useToast } from './Toasts';
@@ -32,6 +33,15 @@ function ScannerUnavailable() {
 
 type Tab = 'show' | 'pin' | 'scan';
 
+/** What the joining area shows while this device pairs with another one. */
+export interface JoinUi {
+  text: string;
+  /** PIN pairing: the security code to compare with the other screen. */
+  code?: string;
+  /** A question for the person, answered with the buttons. */
+  ask?: { question: string; yes: string; onAnswer: (yes: boolean) => void };
+}
+
 interface Props {
   mesh: Mesh | null;
   groupSecret: string;
@@ -40,12 +50,15 @@ interface Props {
   /** This device already has paired / signed-in devices, so show a compact version. */
   compact: boolean;
   /** Set while joining another device; shows what is happening. */
-  joining: string | null;
+  joining: JoinUi | null;
   onCancelJoin: () => void;
+  /** "Keep nothing" mode: Google sign-in is hidden (it would leave this browser signed in to Google). */
+  privateMode: boolean;
   hasPaired: () => boolean;
-  onKnock: (device: DeviceInfo, signal: AbortSignal) => Promise<boolean>;
+  onKnock: (device: DeviceInfo, code: string, signal: AbortSignal) => Promise<boolean>;
   onAdopt: (secret: string, device: DeviceInfo) => Promise<void>;
   onPaired: (device: DeviceInfo, via: 'qr' | 'pin') => void;
+  onCollision: () => void;
   onEnterPin: (pin: string) => void;
   onScanned: (text: string) => void;
   onGoogle: () => void;
@@ -79,6 +92,7 @@ export function ConnectPanel(props: Props) {
     onKnock: props.onKnock,
     onAdopt: props.onAdopt,
     onPaired: props.onPaired,
+    onCollision: props.onCollision,
   });
 
   const tabs: Array<{ id: Tab; label: string; icon: typeof QrIcon }> = [
@@ -114,12 +128,30 @@ export function ConnectPanel(props: Props) {
       </button>
 
       {joining && (
-        <div className="mt-5 rounded-2xl bg-surface-2 p-5 flex items-center gap-3" aria-live="polite">
-          <Loader2 className="w-5 h-5 animate-spin text-brand shrink-0" />
-          <p className="text-sm flex-1 min-w-0">{joining}</p>
-          <button type="button" className="btn btn-ghost text-sm min-h-9 px-3 shrink-0" onClick={props.onCancelJoin}>
-            Cancel
-          </button>
+        <div className="mt-5 rounded-2xl bg-surface-2 p-5" aria-live="polite">
+          <div className="flex items-center gap-3">
+            {!joining.ask && <Loader2 className="w-5 h-5 animate-spin text-brand shrink-0" />}
+            <p className="text-sm flex-1 min-w-0">{joining.text}</p>
+          </div>
+          {joining.code && (
+            <div className="mt-4 rounded-xl bg-surface p-4 text-center">
+              <p className="text-xs font-semibold uppercase tracking-wider text-muted">Security code</p>
+              <p className="mt-1 font-mono text-4xl font-semibold tracking-[0.15em] tabular-nums" aria-label={`Security code ${joining.code.split('').join(' ')}`}>
+                {formatCode(joining.code)}
+              </p>
+            </div>
+          )}
+          {joining.ask && <p className="mt-4 text-sm">{joining.ask.question}</p>}
+          <div className="mt-4 flex flex-wrap justify-end gap-2">
+            <button type="button" className="btn btn-ghost text-sm min-h-10 px-4" onClick={props.onCancelJoin}>
+              Cancel
+            </button>
+            {joining.ask && (
+              <button type="button" className="btn btn-primary text-sm min-h-10 px-4" onClick={() => joining.ask?.onAnswer(true)}>
+                {joining.ask.yes}
+              </button>
+            )}
+          </div>
         </div>
       )}
 
@@ -171,8 +203,9 @@ export function ConnectPanel(props: Props) {
                         className="hover:text-ink cursor-pointer p-1"
                         aria-label="Copy pairing link"
                         onClick={() =>
-                          copyText(pairing.link)
-                            .then(() => toast({ tone: 'success', title: 'Pairing link copied', body: 'Open it on the other device within 3 minutes.' }))
+                          // A fresh code, so the full 3 minutes are left.
+                          copyText(pairing.refresh())
+                            .then(() => toast({ tone: 'success', title: 'Pairing link copied', body: 'Open it on the other device within 3 minutes. It works once.' }))
                             .catch(() => {})
                         }
                       >
@@ -212,16 +245,24 @@ export function ConnectPanel(props: Props) {
             <div className="mt-6 pt-5 border-t border-line">
               <p className="text-sm font-semibold">Or sign in on both devices</p>
               <p className="text-sm text-muted mt-0.5">
-                Your devices signed in to the same Google account or wallet find each other automatically.
+                Your devices signed in to the same {props.privateMode ? 'wallet' : 'Google account or wallet'} find each other. The first time,
+                {props.privateMode ? ' they connect right away.' : ' Google asks you to confirm a code on both.'}
               </p>
-              <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2 gap-2">
-                <button type="button" className="btn btn-outline" onClick={props.onGoogle}>
-                  <GoogleMark /> Continue with Google
-                </button>
+              <div className={`mt-4 grid grid-cols-1 gap-2 ${props.privateMode ? '' : 'sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2'}`}>
+                {!props.privateMode && (
+                  <button type="button" className="btn btn-outline" onClick={props.onGoogle}>
+                    <GoogleMark /> Continue with Google
+                  </button>
+                )}
                 <button type="button" className="btn btn-outline" onClick={props.onWallet}>
                   <Wallet className="w-4 h-4" /> Connect wallet
                 </button>
               </div>
+              {props.privateMode && (
+                <p className="mt-3 text-xs text-muted">
+                  Google sign-in is off in “Keep nothing” mode: it would leave this browser signed in to Google for the next person.
+                </p>
+              )}
             </div>
           )}
         </div>

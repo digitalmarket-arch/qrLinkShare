@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { DownloadCloud, HardDrive, Info, ShieldCheck, UploadCloud } from 'lucide-react';
 import { formatBytes } from '../lib/shared';
 import { storageEstimate } from '../lib/db';
-import { isIOS, isStandalone } from '../lib/browser';
+import { isIOS, safariMayDelete } from '../lib/browser';
 
 interface Props {
   privateMode: boolean;
@@ -21,7 +21,8 @@ export function DevicePanel({ privateMode, persistent, persisted, savedCount, on
   const [usage, setUsage] = useState<{ used: number; quota: number } | null>(null);
   const [busy, setBusy] = useState(false);
   const restoreInput = useRef<HTMLInputElement>(null);
-  const iosSafari = isIOS() && !isStandalone();
+  const safari = safariMayDelete();
+  const ios = isIOS();
 
   useEffect(() => {
     void storageEstimate().then(setUsage);
@@ -49,7 +50,7 @@ export function DevicePanel({ privateMode, persistent, persisted, savedCount, on
           ? 'Nothing is kept on this computer: closing or reloading this tab clears everything, including the pairing.'
           : !persistent
             ? 'This browser won’t let qrLinkShare store anything: items disappear when you reload or close this tab.'
-            : 'Everything is stored only on your devices, in this browser. Nothing is stored on any server.'}
+            : 'Everything you share is stored only on your devices, in this browser. Nothing you share is stored on any server.'}
       </p>
       <p className="mt-2 text-xs text-muted">
         To find each other, devices pass a tiny encrypted “here I am” through public relays, and each asks a public address service
@@ -82,19 +83,26 @@ export function DevicePanel({ privateMode, persistent, persisted, savedCount, on
 
       {!privateMode && persistent && (
         <div className="mt-4 pt-4 border-t border-line">
-          {iosSafari && (
+          {safari && (
             <p className="mb-3 rounded-xl bg-surface-2 p-3 text-xs flex items-start gap-2" role="note">
               <Info className="w-4 h-4 shrink-0 text-warn" />
-              <span>
-                <b>iPhone / iPad:</b> Safari deletes a website’s data (Saved items and pairing) if you don’t open it for 7 days. To keep
-                them: tap <b>Backup</b>, then <b>Share → Add to Home Screen</b>. Open qrLinkShare from the Home Screen, tap <b>Restore</b>{' '}
-                and pair again there (the Home Screen app starts empty).
-              </span>
+              {ios ? (
+                <span>
+                  <b>iPhone / iPad:</b> Safari deletes a website’s data (Saved items and pairing) after 7 days of using Safari without
+                  opening it. To keep them: tap <b>Backup</b>, then <b>Share → Add to Home Screen</b>. Open qrLinkShare from the Home Screen,
+                  tap <b>Restore</b> and pair again there (the Home Screen app starts empty).
+                </span>
+              ) : (
+                <span>
+                  <b>Safari on Mac:</b> Safari deletes a website’s data (Saved items and pairing) after 7 days of using Safari without opening
+                  it. Tap <b>Backup</b> now and then, or use qrLinkShare in another browser, or add it to the Dock (File → Add to Dock).
+                </span>
+              )}
             </p>
           )}
           <p className="text-xs text-muted">
             Your saved items exist only on your devices. If you clear this browser’s data, they’re gone, so download a backup now and then.
-            {persisted === false && !iosSafari && ' This browser may also clear storage when the device runs low on space.'}
+            {persisted === false && !safari && ' This browser may also clear storage when the device runs low on space.'}
           </p>
           <div className="mt-3 grid grid-cols-2 gap-2">
             <button type="button" className="btn btn-outline text-sm" disabled={busy || savedCount === 0} onClick={() => run(onBackup)}>

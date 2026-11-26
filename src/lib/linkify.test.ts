@@ -148,3 +148,16 @@ test('extractLinks lists each link once, in order of appearance', () => {
   assert.deepEqual(extractLinks('no links, just example.com and ftp://x.com'), []);
   assert.deepEqual(extractLinks(''), []);
 });
+
+test('links inside Chinese/Japanese sentences stop at full-width punctuation and curly quotes', () => {
+  assert.deepEqual(extractLinks('链接：https://example.com/page，请查看'), ['https://example.com/page']);
+  assert.deepEqual(extractLinks('詳しくはhttps://example.jp/a。ありがとう'), ['https://example.jp/a']);
+  assert.deepEqual(extractLinks('“https://example.com/q”'), ['https://example.com/q']);
+  assert.deepEqual(extractLinks('（https://example.com/x）を見て'), ['https://example.com/x']);
+  // A link whose own path is in Chinese stays whole.
+  const zh = extractLinks('看 https://zh.wikipedia.org/wiki/中文 吧');
+  assert.equal(zh.length, 1);
+  assert.ok(zh[0].startsWith('https://zh.wikipedia.org/wiki/'));
+  const parts = splitLinks('链接：https://example.com/page，请查看');
+  assert.equal(parts.map((p) => p.text).join(''), '链接：https://example.com/page，请查看');
+});

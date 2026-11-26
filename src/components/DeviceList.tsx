@@ -1,4 +1,4 @@
-import { Monitor, Smartphone, Tablet, Unlink } from 'lucide-react';
+import { Monitor, Smartphone, Tablet, Unlink, X } from 'lucide-react';
 import type { ConnectedDevice, DeviceInfo, KnownDevice, LinkMethod } from '../types/share';
 import { timeAgo } from '../lib/shared';
 
@@ -15,9 +15,11 @@ interface Props {
   /** Devices seen before that aren't connected right now. */
   offline: KnownDevice[];
   onUnpair: () => void;
+  /** Removes one remembered device (e.g. one that was reset and will never come back). */
+  onForget: (device: KnownDevice) => void;
 }
 
-export function DeviceList({ self, devices, offline, onUnpair }: Props) {
+export function DeviceList({ self, devices, offline, onUnpair, onForget }: Props) {
   const SelfIcon = ICONS[self.type] ?? Monitor;
   return (
     <section aria-labelledby="devices-title" className="card p-5">
@@ -62,6 +64,15 @@ export function DeviceList({ self, devices, offline, onUnpair }: Props) {
                 <p className="text-sm font-semibold truncate">{d.name}</p>
                 <p className="text-xs text-muted">Offline · seen {timeAgo(new Date(d.lastSeen).toISOString())}. Catches up when it’s back</p>
               </div>
+              <button
+                type="button"
+                className="icon-btn shrink-0"
+                aria-label={`Forget ${d.name}`}
+                title="Forget this device"
+                onClick={() => onForget(d)}
+              >
+                <X className="w-4 h-4" />
+              </button>
             </li>
           );
         })}

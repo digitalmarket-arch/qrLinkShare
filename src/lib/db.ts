@@ -109,6 +109,8 @@ type BlobRecord = Blob | { bytes: ArrayBuffer; type: string };
 
 async function idbStore(): Promise<Store> {
   const db = await openDb();
+  // Another tab is deleting the database (it switched to "keep nothing"): let go of it.
+  db.onversionchange = () => db.close();
   const run = async <T>(stores: string[], mode: IDBTransactionMode, fn: (tx: IDBTransaction) => Promise<T> | T): Promise<T> => {
     const tx = db.transaction(stores, mode);
     const done = txDone(tx);
@@ -190,10 +192,20 @@ export async function openStore(privateMode: boolean): Promise<Store> {
 
 /** Deletes this app's whole on-device database (used when switching to "keep nothing"). */
 export function deleteDatabase(): Promise<void> {
+  return deleteNamedDatabase(DB_NAME);
+}
+
+/** Deletes one IndexedDB database by name; waits up to a few seconds if another tab still has it open. */
+export function deleteNamedDatabase(name: string): Promise<void> {
   return new Promise((resolve) => {
     try {
-      const req = indexedDB.deleteDatabase(DB_NAME);
-      req.onsuccess = req.onerror = req.onblocked = () => resolve();
+      if (typeof indexedDB === 'undefined') return resolve();
+      const req = indexedDB.deleteDatabase(name);
+      const timer = setTimeout(resolve, 4000); // blocked by an open tab: it is told to close and the delete finishes later
+      req.onsuccess = req.onerror = () => {
+        clearTimeout(timer);
+        resolve();
+      };
     } catch {
       resolve();
     }

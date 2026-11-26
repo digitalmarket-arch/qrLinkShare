@@ -110,3 +110,9 @@ test('temporary items count down; saved items never expire', () => {
   assert.equal(formatTimeLeft(10_000), 'less than a minute');
   assert.equal(formatTimeLeft(Infinity), '');
 });
+
+test('a link that grows too long when encoded is treated as a note (the other device would refuse it)', () => {
+  const ru = 'https://ru.wikipedia.org/wiki/' + 'Москва_'.repeat(120); // ~870 characters typed, ~4,500 encoded
+  assert.equal(toHttpUrl(ru), null);
+  assert.ok(toHttpUrl('https://ru.wikipedia.org/wiki/Москва')?.startsWith('https://ru.wikipedia.org/wiki/%D0%9C'));
+});

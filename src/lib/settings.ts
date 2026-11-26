@@ -103,7 +103,19 @@ export const loadAccount = () => read<Account>(scoped(), 'qrls.account');
 export const saveAccount = (account: Account | null) => write(scoped(), 'qrls.account', account);
 
 /** Devices seen before, so they can be shown while offline and catch up when they return. */
-export const loadKnownDevices = () => read<Record<string, KnownDevice>>(scoped(), 'qrls.known') ?? {};
+export function loadKnownDevices(): Record<string, KnownDevice> {
+  const raw = read<Record<string, KnownDevice & { method?: KnownDevice['methods'][number] }>>(scoped(), 'qrls.known') ?? {};
+  const out: Record<string, KnownDevice> = {};
+  for (const [id, d] of Object.entries(raw)) {
+    if (!d || typeof d.id !== 'string') continue;
+    // Older versions stored a single `method`.
+    const methods = Array.isArray(d.methods) ? d.methods : d.method ? [d.method] : [];
+    if (!methods.length) continue;
+    const { method: _m, ...rest } = d;
+    out[id] = { ...rest, methods };
+  }
+  return out;
+}
 export const saveKnownDevices = (known: Record<string, KnownDevice>) => write(scoped(), 'qrls.known', known);
 
 /**

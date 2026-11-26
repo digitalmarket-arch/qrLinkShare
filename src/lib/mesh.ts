@@ -16,13 +16,20 @@
  * verdict. Only when both sides accept each other is a device "connected". Anything
  * from anyone else is refused.
  *
+ * Security codes: a PIN is short, and anyone watching the public relays can work out
+ * which PIN room is in use. So when devices meet with a PIN (or meet for the first
+ * time through a Google account), both screens show the same 4-digit code, computed
+ * from both devices' ids and random numbers each side commits to before seeing the
+ * other's. Someone sitting in between can't make the two screens show the same code,
+ * so the person compares them and confirms on both devices.
+ *
  * Delivery has receipts: an item only counts as delivered once the other device
  * answers that it has saved it (and its file). Until then it stays "waiting".
  */
 import { joinRoom, getRelaySockets, type Room, type MessageAction, type RequestAction, type JoinRoomConfig } from 'trystero';
 import type { ConnectedDevice, DeviceInfo, DeviceType, LinkMethod, WireItem } from '../types/share';
-import { MAX_FILE_BYTES, MAX_TEXT_CHARS } from './shared';
-import { APP_ID, groupRoom, inviteRoom, isValidSecret, pinRoom, type RoomRef } from './pairing';
+import { MAX_FILE_BYTES, MAX_TEXT_CHARS, MAX_URL_CHARS } from './shared';
+import { APP_ID, groupRoom, inviteRoom, isValidSecret, pinRoom, randomSecret, sha256Hex, type RoomRef } from './pairing';
 
 export type HelloAuth = { idToken?: string };
 
@@ -32,23 +39,39 @@ type Hello = {
   auth?: HelloAuth;
   /** A "keep nothing" device: it is a new device every visit, so it shouldn't be remembered. */
   ephemeral?: boolean;
-  /** Account room: this device waits for the other one to prove itself first. */
+  /** Account room (Google): no sign-in token yet, this device first wants to confirm the other one. */
   withheld?: boolean;
+  /** Account room (Google): this device has already approved the other one. */
+  known?: boolean;
   /** Meeting rooms: this device already has paired devices. */
   paired?: boolean;
+  /** PIN meeting room: commitment to this device's security-code number. */
+  commit?: string;
 };
 
+/** Security-code exchange: first a commitment, then the numbers themselves. */
+type Sas = { v: 1; commit?: string; nonce?: string };
 /** Host -> joining device, in a meeting room. */
-type Welcome = { v: 1; group?: string; adopt?: boolean; adopted?: boolean; denied?: boolean; expired?: boolean };
+type Welcome = {
+  v: 1;
+  host?: DeviceInfo;
+  group?: string;
+  adopt?: boolean;
+  adopted?: boolean;
+  denied?: boolean;
+  expired?: boolean;
+  /** Two devices used the same code at once: refused for safety. */
+  busy?: boolean;
+};
 /** Joining device -> host, in a meeting room. */
-type JoinReply = { v: 1; ok?: boolean; group?: string };
+type JoinReply = { v: 1; ok?: boolean; group?: string; cancel?: boolean };
 /** Small control messages between devices in the same room. */
 type Control = { v: 1; verdict?: boolean; moveTo?: string; bye?: boolean };
 type Withdraw = { v: 1; id: string };
 
 /** What the receiving device answers when it gets an item. */
-export type Receipt = 'ok' | 'have' | 'need-file';
-export type DeliveryResult = 'delivered' | 'unreachable' | 'refused' | 'aborted';
+export type Receipt = 'ok' | 'have' | 'need-file' | 'no-space';
+export type DeliveryResult = 'delivered' | 'unreachable' | 'refused' | 'no-space' | 'aborted';
 export type JoinStatus = 'looking' | 'found' | 'approval';
 
 /** Decides whether a device in the account room really belongs to the same account. */
@@ -61,13 +84,12 @@ export interface AccountSession {
   auth: () => Promise<HelloAuth>;
   verify: AccountVerifier;
   /**
-   * Google only: may this device show its proof to that device before that device has
-   * shown its own? (Proofs are sign-in tokens; established devices don't hand theirs
-   * to strangers.)
+   * Google only: devices approved before reconnect without a question. Any other device
+   * must be confirmed with a security code first, and only then sees this device's token.
    */
-  revealFirst?: (peerDeviceId: string) => boolean;
-  /** Google only: both devices are waiting for each other; ask the person whether to go first. */
-  onStuck?: (device: DeviceInfo, signal: AbortSignal) => Promise<boolean>;
+  isApproved?: (peerDeviceId: string) => boolean;
+  /** Google only: shows the security code for a device not approved yet and asks the person. */
+  approve?: (device: DeviceInfo, code: string, signal: AbortSignal) => Promise<boolean>;
 }
 
 /** The app's side of receiving: store things, then answer. Throwing refuses the item. */
@@ -84,11 +106,30 @@ export interface HostHandlers {
   groupSecret: () => string;
   /** Whether this device already has paired devices (then the other device joins this group). */
   hasPaired: () => boolean;
-  /** A device typed this device's PIN: ask the person. `signal` aborts if that device gives up. */
-  onKnock: (device: DeviceInfo, signal: AbortSignal) => Promise<boolean>;
+  /**
+   * A device typed this device's PIN: show the security code and ask the person.
+   * `signal` aborts if that device gives up.
+   */
+  onKnock: (device: DeviceInfo, code: string, signal: AbortSignal) => Promise<boolean>;
   /** The other device brought its own group and this device had none: join that group. */
   onAdopt: (secret: string, device: DeviceInfo) => Promise<void>;
   onPaired: (device: DeviceInfo, via: 'qr' | 'pin') => void;
+  /** The code shouldn't be used again (declined, abandoned, or two devices used it at once). */
+  onSpent: (reason: 'declined' | 'left' | 'collision') => void;
+}
+
+export interface JoinOptions {
+  /** This device's current group secret (read when it is needed, so it is never stale). */
+  mySecret: () => string;
+  /** Whether this device already has paired devices. */
+  paired: boolean;
+  signal?: AbortSignal;
+  onStatus?: (s: JoinStatus) => void;
+  /**
+   * Asks the person before anything is shared: with a PIN, whether both screens show
+   * `code`; with a QR code, whether to bring this device's other devices along (merge).
+   */
+  confirm: (req: { code: string | null; host: DeviceInfo | null; merge: boolean }) => Promise<boolean>;
 }
 
 export interface MeshOptions {
@@ -104,6 +145,17 @@ export interface MeshOptions {
 
 export type RelayStatus = 'connecting' | 'online' | 'offline';
 
+interface SasState {
+  mine: string;
+  sentCommit: boolean;
+  sentNonce: boolean;
+  theirCommit?: string;
+  theirNonce?: string;
+  code?: string;
+  asked: boolean;
+  abort: AbortController | null;
+}
+
 interface PeerRecord {
   peerId: string;
   userId: string;
@@ -117,10 +169,17 @@ interface PeerRecord {
   readyAt: number;
   /** What our hello to it contained so far. */
   sent: 'none' | 'withheld' | 'full';
-  /** What its hello to us contained so far. */
-  theirs: 'none' | 'withheld' | 'full';
   sending: boolean;
-  wantFull: boolean;
+  /** Its latest proof (Google token), kept until we may check it. */
+  proof: HelloAuth | undefined;
+  /** It sent its full hello (with proof, if the room needs one). */
+  gotFull: boolean;
+  /** It says it has approved us before (Google). */
+  knowsUs: boolean;
+  /** The person confirmed this device with a security code (Google). */
+  allowed: boolean;
+  /** The person said it is not their device. */
+  denied: boolean;
   checking: boolean;
   /** Fresh hellos sent because the other device didn't accept ours. */
   retries: number;
@@ -129,8 +188,7 @@ interface PeerRecord {
   /** Resolves once its first hello has been checked (or after a timeout). */
   firstCheck: Promise<void>;
   markChecked: () => void;
-  stuckAsked: boolean;
-  stuck: AbortController | null;
+  sas: SasState | null;
 }
 
 /** How long to wait for a device's hello before refusing what it sends. */
@@ -139,7 +197,10 @@ const VERDICT_TIMEOUT_MS = 20_000;
 const ITEM_TIMEOUT_MS = 60_000;
 /** Pairing: how long to look for the other device before saying it isn't there. */
 const LOOK_TIMEOUT_MS = 25_000;
+/** Pairing: how long the person has to compare codes and confirm. */
+const DECIDE_TIMEOUT_MS = 180_000;
 const UNTRUSTED = 'not-trusted';
+const NO_SPACE = 'no-space';
 
 interface Channel {
   kind: 'group' | 'legacy' | 'account';
@@ -152,6 +213,7 @@ interface Channel {
   item: RequestAction<WireItem, Receipt>;
   file: RequestAction<Blob | Uint8Array, Receipt>;
   hello: MessageAction<Hello>;
+  sas: MessageAction<Sas>;
   ctl: MessageAction<Control>;
   withdraw: MessageAction<Withdraw>;
 }
@@ -187,7 +249,7 @@ export function isWireItem(x: unknown): x is WireItem {
   if (i.expiresAt !== undefined && (typeof i.expiresAt !== 'string' || Number.isNaN(Date.parse(i.expiresAt)))) return false;
   if (!i.from || typeof i.from.id !== 'string' || typeof i.from.name !== 'string') return false;
   if (i.kind === 'text' && (typeof i.text !== 'string' || i.text.length > MAX_TEXT_CHARS)) return false;
-  if (i.kind === 'link' && (typeof i.url !== 'string' || !/^https?:\/\//i.test(i.url) || i.url.length > 4000)) return false;
+  if (i.kind === 'link' && (typeof i.url !== 'string' || !/^https?:\/\//i.test(i.url) || i.url.length > MAX_URL_CHARS)) return false;
   if (i.kind === 'file') {
     const f = i.file;
     if (!f || typeof f.name !== 'string' || typeof f.mime !== 'string' || typeof f.size !== 'number') return false;
@@ -199,6 +261,19 @@ export function isWireItem(x: unknown): x is WireItem {
 function isDeviceInfo(d: unknown): d is DeviceInfo {
   const x = d as DeviceInfo;
   return !!x && typeof x.id === 'string' && typeof x.name === 'string' && x.name.length <= 80 && ['desktop', 'mobile', 'tablet'].includes(x.type);
+}
+
+const isNonce = (n: unknown): n is string => typeof n === 'string' && /^[A-Za-z0-9_-]{16,64}$/.test(n);
+const isHash = (h: unknown): h is string => typeof h === 'string' && /^[0-9a-f]{64}$/.test(h);
+
+/**
+ * The 4-digit security code both screens show. It mixes both devices' verified ids and a
+ * random number from each side (each committed to before the other's was known).
+ */
+export async function securityCode(context: string, a: { id: string; nonce: string }, b: { id: string; nonce: string }): Promise<string> {
+  const [first, second] = a.id < b.id ? [a, b] : [b, a];
+  const hex = await sha256Hex(['qrls/sas/v1', context, first.id, first.nonce, second.id, second.nonce].join('|'));
+  return String(parseInt(hex.slice(0, 8), 16) % 10_000).padStart(4, '0');
 }
 
 function newPeerRecord(peerId: string, userId: string): PeerRecord {
@@ -213,16 +288,18 @@ function newPeerRecord(peerId: string, userId: string): PeerRecord {
     acceptsUs: false,
     readyAt: 0,
     sent: 'none',
-    theirs: 'none',
     sending: false,
-    wantFull: false,
+    proof: undefined,
+    gotFull: false,
+    knowsUs: false,
+    allowed: false,
+    denied: false,
     checking: false,
     retries: 0,
     sendFails: 0,
     firstCheck,
     markChecked: () => done(),
-    stuckAsked: false,
-    stuck: null,
+    sas: null,
   };
   setTimeout(() => done(), VERDICT_TIMEOUT_MS);
   return rec;
@@ -233,11 +310,11 @@ const abortError = () => Object.assign(new Error('Cancelled'), { name: 'AbortErr
 
 export class Mesh {
   readonly devicesChanged = new Emitter<ConnectedDevice[]>();
-  /** A device became usable in both directions (emitted again after each reconnect). */
+  /** A device became usable in both directions (emitted again after each reconnect or route change). */
   readonly deviceReady = new Emitter<ConnectedDevice>();
   /** A device of this group moved to another group and asks this one to follow. */
   readonly groupMove = new Emitter<{ secret: string; from: DeviceInfo }>();
-  /** A device said goodbye (it unpaired or signed out). */
+  /** A device said goodbye on one link (it unpaired or signed out). */
   readonly deviceGone = new Emitter<{ id: string; name: string; method: LinkMethod }>();
   readonly receiveProgress = new Emitter<{ id: string; progress: number }>();
   readonly problem = new Emitter<string>();
@@ -286,6 +363,11 @@ export class Mesh {
     return { ...rec.device!, method: ch.method, ...(rec.ephemeral ? { ephemeral: true } : {}) };
   }
 
+  /** Google rooms ask for a security code before trusting a device they don't know. */
+  private needsApproval(ch: Channel) {
+    return !!ch.session?.isApproved;
+  }
+
   /* --------------------------------- channels -------------------------------- */
 
   private openChannel(kind: Channel['kind'], method: LinkMethod, ref: RoomRef, opts: { secret?: string; session?: AccountSession }): Channel {
@@ -301,6 +383,7 @@ export class Mesh {
       item: room.makeAction<WireItem, Receipt>('item', { kind: 'request' }),
       file: room.makeAction<Blob | Uint8Array, Receipt>('file', { kind: 'request' }),
       hello: room.makeAction<Hello>('hello'),
+      sas: room.makeAction<Sas>('sas'),
       ctl: room.makeAction<Control>('ctl'),
       withdraw: room.makeAction<Withdraw>('withdraw'),
     };
@@ -317,8 +400,12 @@ export class Mesh {
       const rec = ch.peers.get(peerId);
       if (!rec) return;
       ch.peers.delete(peerId);
-      rec.stuck?.abort();
-      if (rec.readyAt) this.emitDevices();
+      rec.sas?.abort?.abort();
+      if (!rec.readyAt) return;
+      this.emitDevices();
+      // Still reachable through another connection (another tab or room)? Let its waiting items go there.
+      const other = this.routeTo(rec.userId);
+      if (other && ch.kind !== 'legacy') this.deviceReady.emit(this.asConnected(other.ch, other.rec));
     });
 
     ch.hello.onMessage(async (data, { peerId, userId }) => {
@@ -330,42 +417,29 @@ export class Mesh {
       }
       rec.device = data.device;
       rec.ephemeral = data.ephemeral === true;
+      rec.knowsUs = data.known === true;
       if (rec.verified) {
         // It introduced itself again (maybe our answer got lost): answer again.
         this.sendVerdict(ch, rec, true);
         void this.sendHello(ch, rec);
         return;
       }
-      if (data.withheld) {
-        // It waits for us to prove ourselves first.
-        rec.theirs = 'withheld';
-        if (rec.sent === 'none') void this.sendHello(ch, rec);
-        else if (rec.sent === 'withheld') this.askIfStuck(ch, rec);
-        return;
+      if (!data.withheld) {
+        rec.gotFull = true;
+        rec.proof = data.auth;
       }
-      rec.theirs = 'full';
-      if (rec.checking) return;
-      rec.checking = true;
-      let ok = false;
-      try {
-        ok = ch.session ? await ch.session.verify(data.auth, userId) : true;
-      } catch {
-        ok = false;
-      } finally {
-        rec.checking = false;
+      if (rec.sent === 'none') void this.sendHello(ch, rec);
+      if (this.needsApproval(ch) && (!ch.session!.isApproved!(userId) || !rec.knowsUs)) {
+        await this.startSas(ch, rec);
+        this.askApproval(ch, rec); // in case the code was ready before this hello arrived
       }
-      if (!ch.open || ch.peers.get(peerId) !== rec) return;
-      rec.verified = ok;
-      rec.markChecked();
-      this.sendVerdict(ch, rec, ok);
-      if (ok) {
-        rec.stuck?.abort();
-        // It proved itself, so it may see our proof too.
-        void this.sendHello(ch, rec, true);
-        this.updateReady(ch, rec);
-      } else {
-        void this.sendHello(ch, rec);
-      }
+      await this.evaluate(ch, rec);
+    });
+
+    ch.sas.onMessage(async (data, { peerId, userId }) => {
+      if ((await isSelf(userId)) || !ch.open || !data || data.v !== 1 || !this.needsApproval(ch)) return;
+      const rec = this.peer(ch, peerId, userId);
+      await this.onSas(ch, rec, data);
     });
 
     ch.ctl.onMessage(async (data, { peerId, userId }) => {
@@ -414,7 +488,9 @@ export class Mesh {
       return typeof id === 'string' && ITEM_ID.test(id) ? id : null;
     };
 
-    ch.file.onReceive(async ({ peerId, userId, byteLength, metadata }) => {
+    ch.file.onReceive(async ({ kind, peerId, userId, byteLength, metadata }) => {
+      // Trystero runs this same check on the receipt for a file *we* sent (no metadata there).
+      if (kind === 'response') return byteLength <= 1024;
       const id = fileId(metadata);
       if (!id || byteLength > MAX_FILE_BYTES) return false;
       const rec = await trusted(peerId, userId);
@@ -461,38 +537,126 @@ export class Mesh {
   }
 
   /**
-   * Sends (or upgrades) our hello. In the Google room an established device first sends
-   * a hello without its sign-in token ("withheld") to devices it doesn't know yet.
+   * Sends (or upgrades) our hello. In a Google room our sign-in token goes only to a
+   * device approved before, or one the person just confirmed with a security code.
    */
-  private async sendHello(ch: Channel, rec: PeerRecord, full = false): Promise<void> {
-    if (full) rec.wantFull = true;
+  private async sendHello(ch: Channel, rec: PeerRecord): Promise<void> {
     if (rec.sending || !ch.open) return;
-    const policy = ch.session?.revealFirst;
-    const wantFull = !policy || rec.wantFull || rec.verified || policy(rec.userId);
-    if (rec.sent === 'full' || (rec.sent === 'withheld' && !wantFull)) return;
+    const session = ch.session;
+    const full = this.trustsHere(ch, rec);
+    if (rec.sent === 'full' || (rec.sent === 'withheld' && !full)) return;
     rec.sending = true;
-    let sentNow: PeerRecord['sent'] | null = null;
     try {
       const hello: Hello = { v: 1, device: await this.me(ch.room), ...(this.opts.privateMode ? { ephemeral: true } : {}) };
-      if (wantFull) {
-        const auth = ch.session ? await ch.session.auth() : undefined;
+      if (this.needsApproval(ch)) hello.known = session!.isApproved!(rec.userId);
+      if (full) {
+        const auth = session ? await session.auth() : undefined;
         if (auth && auth.idToken) hello.auth = auth;
       } else {
         hello.withheld = true;
       }
       await ch.hello.send(hello, { target: rec.peerId });
-      sentNow = wantFull ? 'full' : 'withheld';
-      rec.sent = sentNow;
+      rec.sent = full ? 'full' : 'withheld';
     } catch {
       // the connection wasn't ready; try again shortly while that device is still here
       if (rec.sendFails++ < 4) setTimeout(() => ch.peers.get(rec.peerId) === rec && void this.sendHello(ch, rec), 1500 * rec.sendFails);
     } finally {
       rec.sending = false;
     }
-    if (sentNow === 'withheld') {
-      if (rec.wantFull) void this.sendHello(ch, rec, true);
-      else if (rec.theirs === 'withheld') this.askIfStuck(ch, rec);
+    // Approved while that hello was going out: send the full one now.
+    if (rec.sent === 'withheld' && rec.allowed) void this.sendHello(ch, rec);
+  }
+
+  /** Whether this device may trust that one: approved before, or confirmed now with the security code. */
+  private trustsHere(ch: Channel, rec: PeerRecord) {
+    if (!this.needsApproval(ch)) return true;
+    return !rec.denied && (rec.allowed || ch.session!.isApproved!(rec.userId));
+  }
+
+  /** Checks a device once everything it needs is there; tells it the result. */
+  private async evaluate(ch: Channel, rec: PeerRecord) {
+    if (rec.verified || rec.checking || !rec.gotFull || !ch.open || !this.trustsHere(ch, rec)) return;
+    rec.checking = true;
+    let ok = false;
+    try {
+      ok = ch.session ? await ch.session.verify(rec.proof, rec.userId) : true;
+    } catch {
+      ok = false;
+    } finally {
+      rec.checking = false;
     }
+    if (!ch.open || ch.peers.get(rec.peerId) !== rec) return;
+    rec.verified = ok;
+    rec.markChecked();
+    this.sendVerdict(ch, rec, ok);
+    if (ok) {
+      rec.sas?.abort?.abort();
+      void this.sendHello(ch, rec);
+      this.updateReady(ch, rec);
+    }
+  }
+
+  /* ------------------------------ security codes ------------------------------ */
+
+  /** Google room, device not approved yet: start the security-code exchange (the lower id commits first). */
+  private async startSas(ch: Channel, rec: PeerRecord) {
+    const self = await this.selfId();
+    if (!rec.sas) rec.sas = { mine: randomSecret(16), sentCommit: false, sentNonce: false, asked: false, abort: null };
+    const s = rec.sas;
+    if (self < rec.userId && !s.sentCommit) {
+      s.sentCommit = true;
+      await ch.sas.send({ v: 1, commit: await sha256Hex(s.mine) }, { target: rec.peerId }).catch(() => (s.sentCommit = false));
+    }
+  }
+
+  private async onSas(ch: Channel, rec: PeerRecord, data: Sas) {
+    const self = await this.selfId();
+    if (!rec.sas) rec.sas = { mine: randomSecret(16), sentCommit: false, sentNonce: false, asked: false, abort: null };
+    const s = rec.sas;
+    const committer = self < rec.userId; // we committed first; they answer with their number
+    if (isHash(data.commit) && !committer && !s.theirCommit) {
+      s.theirCommit = data.commit;
+      if (!s.sentNonce) {
+        s.sentNonce = true;
+        await ch.sas.send({ v: 1, nonce: s.mine }, { target: rec.peerId }).catch(() => (s.sentNonce = false));
+      }
+      return;
+    }
+    if (!isNonce(data.nonce) || s.theirNonce) return;
+    if (committer) {
+      if (!s.sentCommit) return; // out of order
+      s.theirNonce = data.nonce;
+      if (!s.sentNonce) {
+        s.sentNonce = true;
+        await ch.sas.send({ v: 1, nonce: s.mine }, { target: rec.peerId }).catch(() => {});
+      }
+    } else {
+      if (!s.theirCommit || (await sha256Hex(data.nonce)) !== s.theirCommit) return; // doesn't match what it committed to
+      s.theirNonce = data.nonce;
+    }
+    s.code = await securityCode(`account/${ch.method}`, { id: self, nonce: s.mine }, { id: rec.userId, nonce: s.theirNonce });
+    this.askApproval(ch, rec);
+  }
+
+  private askApproval(ch: Channel, rec: PeerRecord) {
+    const s = rec.sas;
+    const approve = ch.session?.approve;
+    if (!s?.code || s.asked || !rec.device || !approve) return;
+    s.asked = true;
+    s.abort = new AbortController();
+    void approve(rec.device, s.code, s.abort.signal)
+      .then(async (allow) => {
+        if (s.abort?.signal.aborted || !ch.open || ch.peers.get(rec.peerId) !== rec) return;
+        if (!allow) {
+          rec.denied = true;
+          this.sendVerdict(ch, rec, false);
+          return;
+        }
+        rec.allowed = true;
+        await this.sendHello(ch, rec);
+        await this.evaluate(ch, rec);
+      })
+      .catch(() => {});
   }
 
   /** Tells a device whether we accept its hello (retried briefly if the connection isn't ready). */
@@ -519,24 +683,8 @@ export class Mesh {
     setTimeout(() => {
       if (!ch.open || ch.peers.get(rec.peerId) !== rec || rec.acceptsUs) return;
       rec.sent = 'none';
-      void this.sendHello(ch, rec, true);
+      void this.sendHello(ch, rec);
     }, 2000 * rec.retries);
-  }
-
-  /** Both devices wait for the other to go first: ask the person once. */
-  private askIfStuck(ch: Channel, rec: PeerRecord) {
-    const onStuck = ch.session?.onStuck;
-    if (!onStuck || rec.stuckAsked || rec.verified || !rec.device) return;
-    rec.stuckAsked = true;
-    rec.stuck = new AbortController();
-    void onStuck(rec.device, rec.stuck.signal)
-      .then((allow) => {
-        if (allow && ch.open && ch.peers.get(rec.peerId) === rec) void this.sendHello(ch, rec, true);
-      })
-      .catch(() => {})
-      .finally(() => {
-        rec.stuck = null;
-      });
   }
 
   private updateReady(ch: Channel, rec: PeerRecord) {
@@ -558,7 +706,7 @@ export class Mesh {
 
   private closeChannel(ch: Channel) {
     ch.open = false;
-    for (const rec of ch.peers.values()) rec.stuck?.abort();
+    for (const rec of ch.peers.values()) rec.sas?.abort?.abort();
     void ch.room.leave().catch(() => {});
   }
 
@@ -643,6 +791,13 @@ export class Mesh {
     return [...byId.values()];
   }
 
+  /** The links over which a device is connected right now (e.g. paired and same wallet). */
+  linksTo(deviceId: string): LinkMethod[] {
+    const out = new Set<LinkMethod>();
+    for (const ch of this.liveChannels()) for (const p of ch.peers.values()) if (p.userId === deviceId && p.readyAt) out.add(ch.method);
+    return [...out];
+  }
+
   /** Whether any device of this device's own paired group is connected right now. */
   hasGroupPeers(): boolean {
     const ch = this.currentSecret ? this.groups.get(this.currentSecret) : undefined;
@@ -654,11 +809,12 @@ export class Mesh {
   }
 
   /** The newest working connection to a device (an old one may be a dead leftover). */
-  private routeTo(deviceId: string): { ch: Channel; rec: PeerRecord } | null {
+  private routeTo(deviceId: string, exclude?: Set<string>): { ch: Channel; rec: PeerRecord } | null {
     let best: { ch: Channel; rec: PeerRecord } | null = null;
     for (const ch of this.liveChannels()) {
       for (const rec of ch.peers.values()) {
-        if (rec.userId === deviceId && rec.readyAt && (!best || rec.readyAt > best.rec.readyAt)) best = { ch, rec };
+        if (rec.userId !== deviceId || !rec.readyAt || exclude?.has(rec.peerId)) continue;
+        if (!best || rec.readyAt > best.rec.readyAt) best = { ch, rec };
       }
     }
     return best;
@@ -668,7 +824,8 @@ export class Mesh {
 
   /**
    * Sends one item (and its file, if the other device needs it) to one device and
-   * waits for its receipt.
+   * waits for its receipt. If that connection turns out to be gone, tries the device's
+   * other connection (another tab or room) once.
    */
   async deliver(
     item: WireItem,
@@ -676,11 +833,26 @@ export class Mesh {
     deviceId: string,
     opts: { signal?: AbortSignal; onProgress?: (p: number) => void } = {}
   ): Promise<DeliveryResult> {
-    const route = this.routeTo(deviceId);
-    if (!route) return 'unreachable';
-    const { ch, rec } = route;
+    const tried = new Set<string>();
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const route = this.routeTo(deviceId, tried);
+      if (!route) return 'unreachable';
+      tried.add(route.rec.peerId);
+      const result = await this.deliverVia(route, item, blob, opts);
+      if (result !== 'retry') return result;
+    }
+    return 'unreachable';
+  }
+
+  private async deliverVia(
+    { ch, rec }: { ch: Channel; rec: PeerRecord },
+    item: WireItem,
+    blob: Blob | undefined,
+    opts: { signal?: AbortSignal; onProgress?: (p: number) => void }
+  ): Promise<DeliveryResult | 'retry'> {
     try {
       const receipt = await ch.item.request(item, { target: rec.peerId, timeoutMs: ITEM_TIMEOUT_MS, signal: opts.signal });
+      if (receipt === 'no-space') return 'no-space';
       if (receipt === 'need-file') {
         if (!blob) return 'refused';
         const done = await ch.file.request(blob, {
@@ -689,13 +861,15 @@ export class Mesh {
           signal: opts.signal,
           onProgress: (p) => opts.onProgress?.(p),
         });
+        if (done === 'no-space') return 'no-space';
         return done === 'ok' || done === 'have' ? 'delivered' : 'refused';
       }
       return receipt === 'ok' || receipt === 'have' ? 'delivered' : 'refused';
     } catch (err) {
       const kind = errorKind(err);
       if (kind === 'aborted' || opts.signal?.aborted) return 'aborted';
-      if (kind === 'rejected' && String((err as Error).message).includes(UNTRUSTED)) {
+      const message = String((err as Error)?.message ?? '');
+      if (kind === 'rejected' && message.includes(UNTRUSTED)) {
         // It doesn't (yet) trust us: re-introduce ourselves and treat it as not connected.
         rec.acceptsUs = false;
         this.updateReady(ch, rec);
@@ -703,7 +877,8 @@ export class Mesh {
         this.retryHello(ch, rec);
         return 'unreachable';
       }
-      if (kind === 'rejected') return 'refused';
+      if (kind === 'rejected') return message.includes(NO_SPACE) ? 'no-space' : 'refused';
+      if (kind === 'disconnected') return 'retry';
       return 'unreachable';
     }
   }
@@ -719,85 +894,153 @@ export class Mesh {
   /* --------------------------------- pairing --------------------------------- */
 
   /**
-   * Shows this device's code: listens in the meeting rooms for the current QR
-   * invitation and PIN until `expiresAt`. A device arriving with the QR invitation is
-   * welcomed automatically; one arriving with the PIN needs `onKnock` to approve it.
-   * Returns a function that stops listening.
+   * Shows this device's code: listens in the meeting rooms for the current QR invitation
+   * and PIN until `expiresAt`. A device arriving with the QR invitation is welcomed
+   * automatically; one arriving with the PIN goes through the security code and needs
+   * `onKnock` to approve it. Returns a function that stops listening (pairings already
+   * approved are allowed to finish first).
    */
   host(code: { invite: string; pin: string; expiresAt: number }, h: HostHandlers): () => void {
     const rooms: Room[] = [];
-    const controllers = new Set<AbortController>();
+    type Session = { abort: AbortController; approved: boolean; waiting: Array<(r: JoinReply) => void>; sas: Array<(s: Sas) => void> };
+    const sessions = new Map<string, Session>();
+    const endedAt = new Map<string, number>();
+    let spentOnce = false;
+    const spend = (reason: 'declined' | 'left' | 'collision') => {
+      if (spentOnce) return;
+      spentOnce = true;
+      h.onSpent(reason);
+    };
     let stopped = false;
+    let closed = false;
+    const leave = () => {
+      if (closed) return;
+      closed = true;
+      clearTimeout(expiry);
+      for (const r of rooms) void r.leave().catch(() => {});
+    };
+    const leaveWhenIdle = () => {
+      if (stopped && [...sessions.values()].every((s) => !s.approved)) leave();
+    };
     const stop = () => {
       if (stopped) return;
       stopped = true;
-      clearTimeout(expiry);
-      for (const c of controllers) c.abort();
-      for (const r of rooms) void r.leave().catch(() => {});
+      for (const s of sessions.values()) if (!s.approved) s.abort.abort();
+      leaveWhenIdle();
+      setTimeout(leave, 60_000); // approved pairings get a minute to finish
     };
-    // Leave the meeting rooms when the code expires (late arrivals are refused on the spot anyway).
+    // When the code expires, refuse newcomers (checked on arrival) and leave once idle.
     const expiry = setTimeout(() => {
-      if (controllers.size === 0) stop();
+      if (sessions.size === 0) leave();
     }, Math.max(0, code.expiresAt - Date.now()));
 
     const open = async (via: 'qr' | 'pin') => {
       const ref = via === 'qr' ? await inviteRoom(code.invite) : await pinRoom(code.pin);
       if (stopped) return;
-      const room = joinRoom(this.roomConfig(ref, { maxUsers: 2 }), ref.roomId);
+      // The PIN room allows a third device, so a squatter can't lock the real one out: two at once are refused.
+      const room = joinRoom(this.roomConfig(ref, { maxUsers: via === 'pin' ? 3 : 2 }), ref.roomId);
       rooms.push(room);
       const hello = room.makeAction<Hello>('hello');
+      const sas = room.makeAction<Sas>('sas');
       const welcome = room.makeAction<Welcome>('welcome');
       const reply = room.makeAction<JoinReply>('reply');
-      const sessions = new Map<string, { abort: AbortController; waiting: Array<(r: JoinReply) => void> }>();
+      const me = this.me(room);
 
       room.onPeerLeave(({ peerId }) => sessions.get(peerId)?.abort.abort());
       reply.onMessage((data, { peerId }) => {
         const s = sessions.get(peerId);
         if (s && data?.v === 1) for (const fn of s.waiting.splice(0)) fn(data);
       });
+      sas.onMessage((data, { peerId }) => {
+        const s = sessions.get(peerId);
+        if (s && data?.v === 1) for (const fn of s.sas.splice(0)) fn(data);
+      });
+
+      const next = <T,>(s: Session, list: Array<(v: T) => void>, ms: number) =>
+        new Promise<T | null>((resolve) => {
+          const t = setTimeout(() => resolve(null), ms);
+          s.abort.signal.addEventListener('abort', () => (clearTimeout(t), resolve(null)), { once: true });
+          list.push((v) => (clearTimeout(t), resolve(v)));
+        });
 
       hello.onMessage(async (data, { peerId, userId }) => {
-        if (stopped || sessions.has(peerId) || !data || data.v !== 1 || !isDeviceInfo(data.device) || data.device.id !== userId) return;
+        if (stopped || closed || sessions.has(peerId) || !data || data.v !== 1 || !isDeviceInfo(data.device) || data.device.id !== userId) return;
+        if (Date.now() - (endedAt.get(peerId) ?? 0) < 2000) return; // don't let one device flood the sheet
         if (Date.now() >= code.expiresAt) {
           await welcome.send({ v: 1, expired: true }, { target: peerId }).catch(() => {});
           return;
         }
-        const abort = new AbortController();
-        const session = { abort, waiting: [] as Array<(r: JoinReply) => void> };
-        sessions.set(peerId, session);
-        controllers.add(abort);
-        const nextReply = (ms: number) =>
-          new Promise<JoinReply | null>((resolve) => {
-            const t = setTimeout(() => resolve(null), ms);
-            abort.signal.addEventListener('abort', () => (clearTimeout(t), resolve(null)), { once: true });
-            session.waiting.push((r) => (clearTimeout(t), resolve(r)));
-          });
-        try {
-          const ok = via === 'qr' ? true : await h.onKnock(data.device, abort.signal).catch(() => false);
-          if (stopped || abort.signal.aborted) return;
-          if (!ok) {
-            await welcome.send({ v: 1, denied: true }, { target: peerId }).catch(() => {});
+        if (via === 'pin') {
+          if (!isHash(data.commit)) return;
+          // Someone else is already at this PIN: for safety, refuse everyone and use a new code.
+          const others = [...sessions.entries()].filter(([, s]) => !s.approved);
+          if (others.length) {
+            for (const [pid, s] of others) {
+              s.abort.abort();
+              void welcome.send({ v: 1, busy: true }, { target: pid }).catch(() => {});
+            }
+            await welcome.send({ v: 1, busy: true }, { target: peerId }).catch(() => {});
+            spend('collision');
             return;
           }
+        }
+        const session: Session = { abort: new AbortController(), approved: false, waiting: [], sas: [] };
+        sessions.set(peerId, session);
+        let outcome: 'paired' | 'declined' | 'left' | 'other' = 'other';
+        try {
+          if (via === 'pin') {
+            // Security code: we send our number only after its commitment arrived (in the hello),
+            // and it reveals its number only after seeing ours.
+            const mine = randomSecret(16);
+            await sas.send({ v: 1, nonce: mine }, { target: peerId });
+            const theirs = await next<Sas>(session, session.sas, 20_000);
+            if (!theirs || !isNonce(theirs.nonce) || (await sha256Hex(theirs.nonce)) !== data.commit) {
+              outcome = session.abort.signal.aborted ? 'left' : 'other';
+              return;
+            }
+            const sasCode = await securityCode(`pin/${code.pin}`, { id: (await me).id, nonce: mine }, { id: userId, nonce: theirs.nonce });
+            const ok = await h.onKnock(data.device, sasCode, session.abort.signal).catch(() => false);
+            if (stopped || session.abort.signal.aborted) {
+              outcome = 'left';
+              return;
+            }
+            if (!ok) {
+              outcome = 'declined';
+              await welcome.send({ v: 1, denied: true }, { target: peerId }).catch(() => {});
+              return;
+            }
+          }
+          session.approved = true;
+          const host = await me;
           if (!h.hasPaired() && data.paired === true) {
             // This device has no paired devices yet but the other one does: join its group,
             // so the other device keeps all of its existing pairings.
-            await welcome.send({ v: 1, adopt: true }, { target: peerId });
-            const r = await nextReply(15_000);
-            if (!r || !isValidSecret(r.group) || abort.signal.aborted) return;
+            await welcome.send({ v: 1, host, adopt: true }, { target: peerId });
+            const r = await next<JoinReply>(session, session.waiting, DECIDE_TIMEOUT_MS);
+            if (!r || r.cancel || !isValidSecret(r.group)) {
+              outcome = r?.cancel ? 'declined' : 'left';
+              return;
+            }
             await h.onAdopt(r.group, data.device);
             await welcome.send({ v: 1, adopted: true }, { target: peerId }).catch(() => {});
+            outcome = 'paired';
             h.onPaired(data.device, via);
             return;
           }
-          await welcome.send({ v: 1, group: h.groupSecret() }, { target: peerId });
-          const r = await nextReply(10_000);
-          if (r?.ok) h.onPaired(data.device, via);
+          await welcome.send({ v: 1, host, group: h.groupSecret() }, { target: peerId });
+          const r = await next<JoinReply>(session, session.waiting, DECIDE_TIMEOUT_MS);
+          if (r?.ok) {
+            outcome = 'paired';
+            h.onPaired(data.device, via);
+          } else outcome = r?.cancel ? 'declined' : 'left';
         } catch {
-          // the other device left part-way
+          outcome = 'left';
         } finally {
-          controllers.delete(abort);
-          if (controllers.size === 0 && Date.now() >= code.expiresAt) stop();
+          sessions.delete(peerId);
+          endedAt.set(peerId, Date.now());
+          if (via === 'pin' && !stopped && (outcome === 'declined' || outcome === 'left')) spend(outcome);
+          leaveWhenIdle();
+          if (sessions.size === 0 && Date.now() >= code.expiresAt) leave();
         }
       });
     };
@@ -810,24 +1053,31 @@ export class Mesh {
    * Joins another device using its QR invitation or PIN. Resolves with the group secret
    * to use from now on (the other device's, or this device's own if that device adopted it).
    */
-  async joinWith(
-    code: { invite?: string; pin?: string },
-    opts: { mySecret: string; paired: boolean; signal?: AbortSignal; onStatus?: (s: JoinStatus) => void }
-  ): Promise<{ secret: string; adopted: boolean }> {
+  async joinWith(code: { invite?: string; pin?: string }, opts: JoinOptions): Promise<{ secret: string; adopted: boolean; host: DeviceInfo | null }> {
     const isPin = !code.invite;
-    const ref = code.invite ? await inviteRoom(code.invite) : await pinRoom(code.pin ?? '');
+    const pin = code.pin ?? '';
+    const ref = code.invite ? await inviteRoom(code.invite) : await pinRoom(pin);
     if (opts.signal?.aborted) throw abortError();
-    const room = joinRoom(this.roomConfig(ref, { maxUsers: 2 }), ref.roomId);
+    const room = joinRoom(this.roomConfig(ref, { maxUsers: isPin ? 3 : 2 }), ref.roomId);
     const hello = room.makeAction<Hello>('hello');
+    const sas = room.makeAction<Sas>('sas');
     const welcome = room.makeAction<Welcome>('welcome');
     const reply = room.makeAction<JoinReply>('reply');
     const me = this.me(room);
+    const mine = randomSecret(16);
 
     try {
-      return await new Promise<{ secret: string; adopted: boolean }>((resolve, reject) => {
-        let host: string | null = null;
+      return await new Promise<{ secret: string; adopted: boolean; host: DeviceInfo | null }>((resolve, reject) => {
+        let host: { peerId: string; userId: string } | null = null;
+        let hostInfo: DeviceInfo | null = null;
         let settled = false;
         let timer: ReturnType<typeof setTimeout>;
+        /** The person's answer (PIN: the codes match; QR: bring the other devices along). */
+        let decision: Promise<boolean> | null = isPin ? null : opts.paired ? null : Promise.resolve(true);
+        let pendingWelcome: Welcome | null = null;
+        let acting = false;
+        let sentSecret: string | null = null;
+
         const finish = (fn: () => void) => {
           if (settled) return;
           settled = true;
@@ -835,6 +1085,7 @@ export class Mesh {
           fn();
         };
         const fail = (message: string) => finish(() => reject(new Error(message)));
+        const cancelled = () => finish(() => reject(abortError()));
         const deadline = (ms: number, message: string) => {
           clearTimeout(timer);
           timer = setTimeout(() => fail(message), ms);
@@ -845,37 +1096,93 @@ export class Mesh {
             ? 'No device answered this PIN. Check the 6 digits, and that the other device still shows them (they change every 3 minutes).'
             : 'Couldn’t reach the other device. Make sure it still shows the QR code (codes change every 3 minutes and work once), then scan again.'
         );
-        opts.signal?.addEventListener('abort', () => finish(() => reject(abortError())), { once: true });
+        opts.signal?.addEventListener(
+          'abort',
+          () => {
+            if (host) void reply.send({ v: 1, cancel: true }, { target: host.peerId }).catch(() => {});
+            cancelled();
+          },
+          { once: true }
+        );
         opts.onStatus?.('looking');
 
-        room.onPeerJoin(async ({ peerId }) => {
-          if (host || settled) return;
-          host = peerId;
-          opts.onStatus?.(isPin ? 'approval' : 'found');
-          deadline(
-            isPin ? 120_000 : 30_000,
-            isPin ? 'The other device didn’t answer in time. Try again and tap Allow there.' : 'The other device did not answer. Try again.'
-          );
-          await hello.send({ v: 1, device: await me, paired: opts.paired }, { target: peerId }).catch(() => {});
-        });
-        room.onPeerLeave(({ peerId }) => {
-          if (peerId === host) fail('The other device stopped showing this code. Ask for a new one and try again.');
-        });
-        welcome.onMessage(async (data, { peerId }) => {
-          if (peerId !== host || !data || data.v !== 1 || settled) return;
-          if (data.denied) return fail('The other device declined the connection.');
-          if (data.expired) return fail('This code has expired. Use the new code shown on the other device.');
-          if (data.adopt) {
-            // The other device is new: it joins this device's group instead.
-            await reply.send({ v: 1, group: opts.mySecret }, { target: peerId }).catch(() => {});
-            return;
+        /** Acts on the welcome once the person agreed. */
+        const act = async () => {
+          const w = pendingWelcome;
+          if (!w || !host || !decision || acting || settled) return;
+          acting = true;
+          const yes = await decision;
+          if (settled) return;
+          if (!yes) {
+            await reply.send({ v: 1, cancel: true }, { target: host.peerId }).catch(() => {});
+            return cancelled();
           }
-          if (data.adopted) return finish(() => resolve({ secret: opts.mySecret, adopted: true }));
-          if (isValidSecret(data.group)) {
-            await reply.send({ v: 1, ok: true }, { target: peerId }).catch(() => {});
-            return finish(() => resolve({ secret: data.group!, adopted: false }));
+          if (w.adopt) {
+            // The other device is new: it joins this device's group instead.
+            sentSecret = opts.mySecret();
+            await reply.send({ v: 1, group: sentSecret }, { target: host.peerId }).catch(() => {});
+            opts.onStatus?.('approval');
+            return; // wait for 'adopted'
+          }
+          if (isValidSecret(w.group)) {
+            await reply.send({ v: 1, ok: true }, { target: host.peerId }).catch(() => {});
+            return finish(() => resolve({ secret: w.group!, adopted: false, host: hostInfo }));
           }
           fail('The other device sent an invalid answer.');
+        };
+
+        // Introduce ourselves to everyone in the meeting room. Another device that typed the same
+        // PIN may be here too, so the device that shows the code is the one that answers.
+        const greeted = new Map<string, string>(); // peerId -> userId
+        const claim = (peerId: string) => {
+          if (host) return host.peerId === peerId;
+          const userId = greeted.get(peerId);
+          if (!userId) return false;
+          host = { peerId, userId };
+          opts.onStatus?.('found');
+          deadline(DECIDE_TIMEOUT_MS, 'The other device didn’t answer in time. Try again.');
+          return true;
+        };
+        room.onPeerJoin(async ({ peerId, userId }) => {
+          if (host || settled || greeted.has(peerId)) return;
+          greeted.set(peerId, userId);
+          const hi: Hello = { v: 1, device: await me, paired: opts.paired };
+          if (isPin) hi.commit = await sha256Hex(mine);
+          await hello.send(hi, { target: peerId }).catch(() => {});
+        });
+        room.onPeerLeave(({ peerId }) => {
+          if (peerId === host?.peerId) fail('The other device stopped showing this code. Ask for a new one and try again.');
+        });
+
+        sas.onMessage(async (data, { peerId }) => {
+          if (!isPin || settled || decision || !data || data.v !== 1 || !isNonce(data.nonce) || !claim(peerId) || !host) return;
+          // It sent its number after our commitment; now we reveal ours.
+          await sas.send({ v: 1, nonce: mine }, { target: peerId }).catch(() => {});
+          const self = await me;
+          const sasCode = await securityCode(`pin/${pin}`, { id: self.id, nonce: mine }, { id: host.userId, nonce: data.nonce });
+          decision = opts.confirm({ code: sasCode, host: null, merge: opts.paired });
+          void decision.then((yes) => {
+            if (!yes) {
+              void reply.send({ v: 1, cancel: true }, { target: peerId }).catch(() => {});
+              cancelled();
+            } else if (!settled) {
+              opts.onStatus?.('approval');
+              void act();
+            }
+          });
+        });
+
+        welcome.onMessage(async (data, { peerId }) => {
+          if (!data || data.v !== 1 || settled || !claim(peerId) || !host) return;
+          if (data.denied) return fail('The other device declined the connection.');
+          if (data.expired) return fail('This code has expired. Use the new code shown on the other device.');
+          if (data.busy) return fail('Another device used this code at the same time, so it was refused for safety. Use the new code on the other device.');
+          if (data.adopted) return sentSecret ? finish(() => resolve({ secret: sentSecret!, adopted: true, host: hostInfo })) : undefined;
+          if (isDeviceInfo(data.host) && data.host.id === host.userId) hostInfo = data.host;
+          pendingWelcome = data;
+          // QR from a device: if this one has other devices, ask before bringing them along.
+          if (!decision && !isPin) decision = opts.confirm({ code: null, host: hostInfo, merge: true });
+          void act();
         });
       });
     } finally {

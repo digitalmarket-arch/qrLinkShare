@@ -61,13 +61,21 @@ export interface StoredItem extends WireItem {
   status: ItemStatus;
   /** Local time the item was stored on this device (ms). */
   storedAt: number;
-  /** Devices this device has delivered the item to (only for items created here). */
+  /** Devices that confirmed they saved the item (only for items created here). */
   deliveredTo?: string[];
+  /** Devices that couldn't take it, and why (only for items created here). Cleared by "Try again". */
+  refusedBy?: Record<string, RefusalReason>;
+  /** Why an incoming file failed (when known). */
+  failReason?: 'no-space';
 }
+
+/** no-space: the other device is out of storage; refused: it couldn't accept it. */
+export type RefusalReason = 'no-space' | 'refused';
 
 /** A device this one has been connected to before (remembered so it can catch up later). */
 export interface KnownDevice extends DeviceInfo {
-  method: LinkMethod;
+  /** How it is linked; a device can be paired and share an account at the same time. */
+  methods: LinkMethod[];
   /** Items created after this moment are delivered to it when it reconnects. */
   since: number;
   lastSeen: number;
@@ -84,7 +92,6 @@ export interface ConnectedDevice extends DeviceInfo {
 
 /** A signed-in account whose devices connect automatically. */
 export type Account =
-  /** met: this device has already connected with another device of the account. */
-  | { kind: 'google'; uid: string; label: string; met?: boolean }
+  | { kind: 'google'; uid: string; label: string }
   /** roomKey: derived from the wallet's signature of a fixed message (only the wallet can produce it). */
   | { kind: 'wallet'; address: string; label: string; roomKey: string };

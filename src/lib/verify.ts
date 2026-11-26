@@ -36,3 +36,8 @@ export async function verifyGoogleToken(
     return false;
   }
 }
+
+/** Loads the checking code ahead of time (so a later app update can't break it in this tab). */
+export async function preloadVerifier(): Promise<void> {
+  await import('jose');
+}

@@ -46,3 +46,18 @@ export function isStandalone(): boolean {
   if (typeof window === 'undefined') return false;
   return (navigator as Navigator & { standalone?: boolean }).standalone === true || matchMedia('(display-mode: standalone)').matches;
 }
+
+/** Safari on a Mac (not Chrome, Edge, Firefox or Opera, which also say "Safari" in their name). */
+export function isMacSafari(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  const ua = navigator.userAgent;
+  return /Macintosh/.test(ua) && /Safari\//.test(ua) && !/Chrome|Chromium|Edg|OPR|Firefox/.test(ua) && navigator.maxTouchPoints <= 1;
+}
+
+/**
+ * Safari (iPhone, iPad and Mac) deletes a website's stored data after 7 days of using Safari
+ * without visiting the site, unless it is installed (Home Screen / Dock).
+ */
+export function safariMayDelete(): boolean {
+  return (isIOS() || isMacSafari()) && !isStandalone();
+}

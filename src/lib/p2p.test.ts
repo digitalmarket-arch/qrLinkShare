@@ -9,7 +9,7 @@ import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { SignJWT, createLocalJWKSet, exportJWK, generateKeyPair, type JWTVerifyGetKey } from 'jose';
 import { accountRoom, groupRoom, inviteLink, inviteRoom, isValidSecret, parseInviteLink, pinRoom, randomPin, randomSecret } from './pairing';
 import { createMemoryStore } from './db';
-import { isWireItem } from './mesh';
+import { isWireItem, securityCode } from './mesh';
 import { verifyGoogleToken } from './verify';
 import { buildWalletRoomMessage } from './shared';
 import type { StoredItem, WireItem } from '../types/share';
@@ -158,4 +158,21 @@ test('Google check: fails closed when Google’s keys can’t be fetched (no unc
     .sign(privateKey);
   assert.equal(await verifyGoogleToken(selfSigned, 'user-1', project, { jwks: offline }), false);
   assert.equal(await verifyGoogleToken(unsigned, 'user-1', project), false); // no network in tests either way
+});
+
+test('security code: 4 digits, the same on both devices, different for anyone in between', async () => {
+  const phone = { id: 'phone-id-aaaa', nonce: 'N1-phone-random-123' };
+  const laptop = { id: 'laptop-id-bbbb', nonce: 'N2-laptop-random-456' };
+  const a = await securityCode('pin/123456', phone, laptop);
+  const b = await securityCode('pin/123456', laptop, phone); // the other side computes it in the other order
+  assert.match(a, /^\d{4}$/);
+  assert.equal(a, b);
+  // Someone in the middle has another id: each real device then sees a different code.
+  const mitm = { id: 'attacker-id-cccc', nonce: 'N3-attacker' };
+  const phoneSees = await securityCode('pin/123456', phone, mitm);
+  const laptopSees = await securityCode('pin/123456', laptop, mitm);
+  assert.notEqual(phoneSees, laptopSees);
+  // Every input matters.
+  assert.notEqual(await securityCode('pin/654321', phone, laptop), a);
+  assert.notEqual(await securityCode('pin/123456', { ...phone, nonce: 'other' }, laptop), a);
 });

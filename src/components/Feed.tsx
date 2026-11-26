@@ -3,6 +3,7 @@ import { Bookmark, Clock, QrCode, Send, Smartphone } from 'lucide-react';
 import type { Retention, StoredItem } from '../types/share';
 import { ItemCard } from './ItemCard';
 import { loadPref, savePref } from '../lib/settings';
+import { safariMayDelete } from '../lib/browser';
 
 type Filter = 'all' | 'link' | 'file' | 'text';
 
@@ -12,6 +13,8 @@ interface Props {
   myDeviceId: string;
   freshIds: Set<string>;
   progress: Record<string, number>;
+  online: boolean;
+  deviceNames: Record<string, string>;
   autoOpen: boolean;
   onToggleAutoOpen: () => void;
   getBlob: (id: string) => Promise<Blob | undefined>;
@@ -51,9 +54,10 @@ export function Feed(props: Props) {
   }, [list]);
   const visible = filter === 'all' ? list : list.filter((i) => i.kind === filter);
 
+  const safari = useMemo(safariMayDelete, []);
   const sections: Array<{ id: Retention; label: string; icon: typeof Clock; hint: string }> = [
     { id: 'temp', label: 'Temporary', icon: Clock, hint: 'Deleted after 24 h' },
-    { id: 'saved', label: 'Saved', icon: Bookmark, hint: 'Until you delete them' },
+    { id: 'saved', label: 'Saved', icon: Bookmark, hint: safari ? 'Back them up (Safari)' : 'Until you delete them' },
   ];
   const filters: Array<{ id: Filter; label: string }> = [
     { id: 'all', label: 'All' },
@@ -139,6 +143,8 @@ export function Feed(props: Props) {
               myDeviceId={props.myDeviceId}
               fresh={props.freshIds.has(item.id)}
               progress={props.progress[item.id]}
+              online={props.online}
+              deviceNames={props.deviceNames}
               getBlob={props.getBlob}
               onCopy={props.onCopy}
               onShowQr={props.onShowQr}
@@ -156,7 +162,9 @@ export function Feed(props: Props) {
           <span>
             {section === 'temp'
               ? 'Temporary items are deleted 24 hours after they were sent (on a device where qrLinkShare is closed, the next time it opens).'
-              : 'Saved items stay on this device until you delete them.'}
+              : safari
+                ? 'Saved items stay until you delete them, but Safari deletes website data after 7 days of not visiting. Back up (Your data → Backup), or install qrLinkShare (Home Screen / Dock).'
+                : 'Saved items stay on this device until you delete them.'}
           </span>
           <button
             type="button"

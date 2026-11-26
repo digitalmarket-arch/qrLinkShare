@@ -36,6 +36,16 @@ if (AS && typeof AS.any !== 'function') {
   };
 }
 
+// Safari before 16 (iOS 15.4–15.8): used when checking Google sign-ins.
+const AT = AS as unknown as { timeout?: (ms: number) => AbortSignal } | undefined;
+if (AT && typeof AT.timeout !== 'function') {
+  AT.timeout = (ms: number) => {
+    const ctrl = new AbortController();
+    setTimeout(() => ctrl.abort(new DOMException('The operation timed out.', 'TimeoutError')), ms);
+    return ctrl.signal;
+  };
+}
+
 const AP = Array.prototype as unknown as { toSorted?: unknown };
 if (typeof AP.toSorted !== 'function') {
   Object.defineProperty(Array.prototype, 'toSorted', {

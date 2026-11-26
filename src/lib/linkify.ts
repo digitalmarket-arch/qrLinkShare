@@ -7,7 +7,9 @@ import { toHttpUrl } from './shared';
 export type TextPart = { kind: 'text'; text: string } | { kind: 'link'; text: string; url: string };
 
 /** Anything that starts with http:// or https:// up to the next space, quote or angle bracket. */
-const CANDIDATE = /\bhttps?:\/\/[^\s<>"'`]+/gi;
+// Stops at spaces, quotes and angle brackets, and also at curly quotes and the full-width
+// punctuation of Chinese/Japanese text (which uses no spaces): "链接：https://x.com/a，请查看".
+const CANDIDATE = /\bhttps?:\/\/[^\s<>"'`\u2018\u2019\u201C\u201D\u3000-\u303F\uFF01-\uFF0F\uFF1A-\uFF20\uFF3B-\uFF40\uFF5B-\uFF65]+/gi;
 
 /**
  * Punctuation that ends a sentence rather than a link, e.g. "see https://x.com/a." or "(https://x.com/a)".

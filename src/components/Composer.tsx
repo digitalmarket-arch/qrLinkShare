@@ -3,6 +3,7 @@ import { ArrowUp, Bookmark, Clock, Paperclip, UploadCloud } from 'lucide-react';
 import type { Retention, StoredItem } from '../types/share';
 import { MAX_FILE_BYTES, MAX_TEXT_CHARS, formatBytes, toHttpUrl } from '../lib/shared';
 import { loadPref, savePref } from '../lib/settings';
+import { safariMayDelete } from '../lib/browser';
 import { useToast } from './Toasts';
 
 interface Props {
@@ -164,7 +165,7 @@ export function Composer({ deviceCount, initialText, sendText, sendFile }: Props
 
   const options: Array<{ id: Retention; label: string; hint: string; icon: typeof Clock }> = [
     { id: 'temp', label: 'Temporary', hint: 'Deleted after 24 h', icon: Clock },
-    { id: 'saved', label: 'Save', hint: 'Until you delete it', icon: Bookmark },
+    { id: 'saved', label: 'Save', hint: safariMayDelete() ? 'Back it up (Safari)' : 'Until you delete it', icon: Bookmark },
   ];
 
   return (

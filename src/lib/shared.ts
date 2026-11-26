@@ -7,6 +7,8 @@ export const MAX_FILE_BYTES = 200 * 1024 * 1024; // 200 MB per file (sent direct
 /** Temporary items disappear after this long. */
 export const TEMP_TTL_MS = 24 * 60 * 60 * 1000;
 export const MAX_TEXT_CHARS = 20_000;
+/** Longest link accepted (older app versions refuse longer ones). */
+export const MAX_URL_CHARS = 4000;
 export const PIN_LENGTH = 6;
 
 /** Returns the 6 digits of a PIN, or null if it isn't exactly 6 digits. */
@@ -27,7 +29,7 @@ export function formatPin(pin: string): string {
  */
 export function toHttpUrl(input: string): string | null {
   const raw = input.trim();
-  if (!raw || /\s/.test(raw) || raw.length > 4000) return null;
+  if (!raw || /\s/.test(raw) || raw.length > MAX_URL_CHARS) return null;
 
   const hasScheme = /^[a-z][a-z\d+\-.]*:/i.test(raw);
   if (hasScheme && !/^https?:\/\//i.test(raw)) return null;
@@ -41,7 +43,9 @@ export function toHttpUrl(input: string): string | null {
     // Without a scheme, require something that looks like a domain ("example.com").
     if (!hasScheme && !isIp && !/\.[a-z]{2,}$/i.test(host)) return null;
     if (!host.includes('.') && host !== 'localhost') return null;
-    return url.toString();
+    const out = url.toString();
+    // Non-Latin characters grow when encoded; a link the other device would refuse is sent as a note instead.
+    return out.length > MAX_URL_CHARS ? null : out;
   } catch {
     return null;
   }

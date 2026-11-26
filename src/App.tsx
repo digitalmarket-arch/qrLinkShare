@@ -2,11 +2,11 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertTriangle, Loader2 } from 'lucide-react';
 import { clearUserIdentity } from 'trystero';
 import type { Account, DeviceInfo, LinkMethod, Retention, StoredItem } from './types/share';
-import { copyText, downloadBlob, openInNewTab } from './lib/browser';
+import { copyText, downloadBlob, openInNewTab, safariMayDelete } from './lib/browser';
 import { loadPref, savePref, setPrivateMode, forgetPairing } from './lib/settings';
 import { APP_ID, parseInviteLink, randomSecret } from './lib/pairing';
 import { cleanPin, shortAddress } from './lib/shared';
-import { deleteDatabase } from './lib/db';
+import { deleteDatabase, deleteNamedDatabase } from './lib/db';
 import { createBackup, restoreBackup } from './lib/backup';
 import { unlockWalletRoom, walletErrorMessage, type WalletOption } from './lib/wallet';
 import { extractLinks } from './lib/linkify';
@@ -15,7 +15,7 @@ import type { JoinStatus } from './lib/mesh';
 import { useP2P, type IncomingNotice } from './hooks/useP2P';
 import { ToastProvider, useToast } from './components/Toasts';
 import { Header, Logo, type Theme } from './components/Header';
-import { ConnectPanel } from './components/ConnectPanel';
+import { ConnectPanel, type JoinUi } from './components/ConnectPanel';
 import { DeviceList } from './components/DeviceList';
 import { DevicePanel } from './components/DevicePanel';
 import { Composer } from './components/Composer';
@@ -26,7 +26,24 @@ import { WalletModal } from './components/WalletModal';
 
 type FirebaseModule = typeof import('./lib/firebase');
 let firebasePromise: Promise<FirebaseModule> | null = null;
-const loadFirebase = () => (firebasePromise ??= import('./lib/firebase'));
+const loadFirebase = () =>
+  (firebasePromise ??= import('./lib/firebase').catch((err) => {
+    firebasePromise = null;
+    throw err;
+  }));
+
+/** Removes what Google sign-in saved in this browser (before switching to "keep nothing"). */
+async function clearFirebaseTraces() {
+  try {
+    for (const k of Object.keys(localStorage)) if (k.startsWith('firebase:')) localStorage.removeItem(k);
+  } catch {
+    // storage blocked
+  }
+  await deleteNamedDatabase('firebaseLocalStorageDb');
+  await deleteNamedDatabase('firebase-heartbeat-database');
+}
+
+const METHOD_NAME: Record<LinkMethod, string> = { paired: 'QR / PIN pairing', google: 'Google', wallet: 'the wallet' };
 
 export default function App() {
   return (
@@ -70,10 +87,12 @@ function Shell() {
     void launch.shared.then((t) => t && setSharedText(t));
   }, [launch]);
 
-  const [joining, setJoining] = useState<string | null>(null);
+  const [joining, setJoining] = useState<JoinUi | null>(null);
   const joinAbort = useRef<AbortController | null>(null);
   const [knock, setKnock] = useState<Knock | null>(null);
-  const knockAnswer = useRef<((allow: boolean) => void) | null>(null);
+  /** "Allow this device?" questions, shown one at a time (several devices may ask at once). */
+  const knockQueue = useRef<Array<{ knock: Knock; resolve: (allow: boolean) => void }>>([]);
+  const showNextKnock = () => setKnock(knockQueue.current[0]?.knock ?? null);
   const [walletOpen, setWalletOpen] = useState(false);
   const [busyWallet, setBusyWallet] = useState<string | null>(null);
   const [qrItem, setQrItem] = useState<StoredItem | null>(null);
@@ -98,7 +117,8 @@ function Shell() {
           }),
         3000
       );
-      navigator.vibrate?.(30);
+      // Browsers only allow vibration after the person has tapped the page once.
+      if ((navigator as Navigator & { userActivation?: { hasBeenActive: boolean } }).userActivation?.hasBeenActive) navigator.vibrate?.(30);
       if (document.visibilityState === 'hidden') {
         unread.current += 1;
         document.title = `(${unread.current}) qrLinkShare`;
@@ -118,21 +138,22 @@ function Shell() {
     [toast]
   );
 
-  /** Shows the "Allow this device?" sheet; closes it by itself if that device gives up. */
+  /** Shows the "Allow this device?" sheet; it closes by itself if that device gives up. */
   const askKnock = useCallback(
-    (device: DeviceInfo, reason: Knock['reason'], signal: AbortSignal) =>
+    (device: DeviceInfo, reason: Knock['reason'], code: string, signal: AbortSignal) =>
       new Promise<boolean>((resolve) => {
         if (signal.aborted) return resolve(false);
-        knockAnswer.current?.(false); // only one request at a time
-        knockAnswer.current = resolve;
-        setKnock({ device, reason });
+        const entry = { knock: { device, reason, code }, resolve };
+        knockQueue.current.push(entry);
+        if (knockQueue.current.length === 1) showNextKnock();
         signal.addEventListener(
           'abort',
           () => {
-            if (knockAnswer.current !== resolve) return;
-            knockAnswer.current = null;
-            setKnock(null);
+            const i = knockQueue.current.indexOf(entry);
+            if (i === -1) return;
+            knockQueue.current.splice(i, 1);
             resolve(false);
+            if (i === 0) showNextKnock();
             if (reason === 'pin') toast({ tone: 'info', title: `${device.name} stopped waiting`, body: 'Nothing was connected.' }, 4000);
           },
           { once: true }
@@ -142,21 +163,49 @@ function Shell() {
   );
 
   const onDeviceGone = useCallback(
-    (name: string, method: LinkMethod) =>
-      toast(
-        { tone: 'info', title: method === 'paired' ? `${name} unpaired` : `${name} signed out`, body: 'It no longer connects to this device.' },
-        5000
-      ),
+    (name: string, method: LinkMethod, still: LinkMethod[]) => {
+      const title = method === 'paired' ? `${name} unpaired` : `${name} signed out of ${method === 'google' ? 'Google' : 'the wallet'}`;
+      const body = still.length
+        ? `It's still connected through ${still.map((m) => METHOD_NAME[m]).join(' and ')}.`
+        : 'It no longer connects to this device.';
+      toast({ tone: 'info', title, body }, 5000);
+    },
     [toast]
   );
 
   const p2p = useP2P({
     onIncoming,
     onProblem: problem,
-    onAccountKnock: (device, signal) => askKnock(device, 'account', signal),
+    onAccountKnock: (device, code, signal) => askKnock(device, 'account', code, signal),
     onDeviceGone,
+    onGroupMove: (from) =>
+      toast({ tone: 'info', title: `${from.name} paired with another device`, body: 'This device now connects to it too.' }, 6000),
   });
   const isMobile = p2p.self.type !== 'desktop';
+
+  // Google sign-in: load its code now, so a new version published while this tab stays open
+  // can't break it later.
+  useEffect(() => {
+    if (!p2p.ready || p2p.account?.kind !== 'google') return;
+    void loadFirebase().catch(() => {});
+    void import('./lib/verify').then((m) => m.preloadVerifier()).catch(() => {});
+  }, [p2p.ready, p2p.account?.kind]);
+
+  // A part of the app couldn't be downloaded (offline, or a newer version replaced it).
+  useEffect(() => {
+    const onPreloadError = () =>
+      toast(
+        {
+          tone: 'info',
+          title: 'Part of qrLinkShare couldn’t load',
+          body: 'You may be offline, or a new version is out. Reload to continue.',
+          action: { label: 'Reload', onClick: () => location.reload() },
+        },
+        10000
+      );
+    window.addEventListener('vite:preloadError', onPreloadError);
+    return () => window.removeEventListener('vite:preloadError', onPreloadError);
+  }, [toast]);
 
   useEffect(() => {
     const onVisible = () => {
@@ -181,18 +230,56 @@ function Shell() {
       const label: Record<JoinStatus, string> = {
         looking: code.pin ? 'Looking for the device showing this PIN…' : 'Looking for the other device…',
         found: 'Connecting to the other device…',
-        approval: 'Found it. Tap Allow on the other device…',
+        approval: code.pin ? 'Now tap Allow on the other device.' : 'Connecting to the other device…',
       };
-      setJoining(label.looking);
+      const live = () => !abort.signal.aborted && joinAbort.current === abort;
+      setJoining({ text: label.looking });
+      // This device's other paired devices, named in the questions below.
+      const others = [
+        ...p2p.devices.filter((d) => d.method === 'paired'),
+        ...p2p.knownDevices.filter((d) => d.methods.includes('paired')),
+      ].map((d) => d.name);
+      const othersText = others.length ? others.slice(0, 3).join(', ') + (others.length > 3 ? '…' : '') : 'your other paired devices';
       try {
         const res = await mesh.joinWith(code, {
-          mySecret: p2p.groupSecret,
+          mySecret: p2p.currentGroup,
           paired: p2p.hasPaired(),
           signal: abort.signal,
-          onStatus: (st) => !abort.signal.aborted && setJoining(label[st]),
+          onStatus: (st) => live() && setJoining((j) => ({ ...(j ?? {}), text: label[st] })),
+          confirm: ({ code: sas, host, merge }) =>
+            new Promise<boolean>((resolve) => {
+              if (!live()) return resolve(false);
+              const onAnswer = (yes: boolean) => {
+                if (live()) setJoining((j) => (j ? { ...j, ask: undefined, text: yes ? label.approval : j.text } : j));
+                resolve(yes);
+              };
+              abort.signal.addEventListener('abort', () => resolve(false), { once: true });
+              if (sas) {
+                setJoining({
+                  text: 'Found it. Compare this code with the other screen.',
+                  code: sas,
+                  ask: {
+                    question: merge
+                      ? `Does the other device show this same code? Pairing also connects it to ${othersText}.`
+                      : 'Does the other device show this same code?',
+                    yes: 'It matches',
+                    onAnswer,
+                  },
+                });
+              } else {
+                setJoining({
+                  text: `Pair with ${host?.name ?? 'this device'}?`,
+                  ask: { question: `${othersText} will connect to it too.`, yes: 'Pair', onAnswer },
+                });
+              }
+            }),
         });
         if (!res.adopted) await p2p.joinGroup(res.secret);
-        toast({ tone: 'success', title: 'Paired', body: 'These devices now connect automatically whenever both have this page open.' });
+        toast({
+          tone: 'success',
+          title: res.host ? `Paired with ${res.host.name}` : 'Paired',
+          body: 'These devices now connect automatically whenever both have this page open.',
+        });
       } catch (err) {
         if ((err as Error).name !== 'AbortError') toast({ tone: 'error', title: 'Could not pair', body: (err as Error).message }, 9000);
       } finally {
@@ -202,8 +289,10 @@ function Shell() {
         }
       }
     },
-    [p2p.mesh, p2p.groupSecret, p2p.hasPaired, p2p.joinGroup, toast]
+    [p2p.mesh, p2p.currentGroup, p2p.hasPaired, p2p.joinGroup, p2p.devices, p2p.knownDevices, toast]
   );
+  const joinRef = useRef(join);
+  joinRef.current = join;
   const cancelJoin = () => {
     joinAbort.current?.abort();
     joinAbort.current = null;
@@ -213,26 +302,38 @@ function Shell() {
   // Opened from a pairing QR code (also when the link is opened in a tab that already has the app).
   useEffect(() => {
     if (!p2p.ready) return;
-    if (launch.invite) void join({ invite: launch.invite });
+    if (launch.invite) void joinRef.current({ invite: launch.invite });
     const onHash = () => {
       const invite = parseInviteLink(location.hash);
       if (!invite) return;
       history.replaceState(null, '', `${location.pathname}${location.search}`);
-      void join({ invite });
+      void joinRef.current({ invite });
     };
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
   }, [p2p.ready]);
 
-  const onKnock = useCallback((device: DeviceInfo, signal: AbortSignal) => askKnock(device, 'pin', signal), [askKnock]);
+  const onKnock = useCallback(
+    (device: DeviceInfo, code: string, signal: AbortSignal) => askKnock(device, 'pin', code, signal),
+    [askKnock]
+  );
 
   /** This device had no paired devices and the new one did: join the new one's group. */
-  const onAdopt = useCallback((secret: string) => p2p.switchGroup(secret, { migrate: false }), [p2p.switchGroup]);
+  const onAdopt = useCallback((secret: string) => p2p.adoptGroup(secret), [p2p.adoptGroup]);
+
+  const onCollision = useCallback(
+    () =>
+      toast(
+        { tone: 'error', title: 'Two devices used this PIN at once', body: 'For safety a new code is shown. Try again with the new PIN.' },
+        8000
+      ),
+    [toast]
+  );
 
   const answerKnock = (allow: boolean) => {
-    knockAnswer.current?.(allow);
-    knockAnswer.current = null;
-    setKnock(null);
+    const head = knockQueue.current.shift();
+    head?.resolve(allow);
+    showNextKnock();
   };
 
   const onPaired = useCallback(
@@ -276,7 +377,12 @@ function Shell() {
         await fb.authReady();
         firebaseRef.current = fb;
       } catch {
-        toast({ tone: 'error', title: 'Google sign-in could not load', body: 'Check your internet connection and try again.' });
+        toast({
+          tone: 'error',
+          title: 'Google sign-in couldn’t load',
+          body: 'You may be offline, or qrLinkShare was just updated. Reload the page to try again.',
+          action: { label: 'Reload', onClick: () => location.reload() },
+        });
         return;
       }
     }
@@ -314,8 +420,8 @@ function Shell() {
 
   const signOut = async () => {
     const wasGoogle = p2p.account?.kind === 'google';
-    await p2p.leaveAccount();
-    if (wasGoogle) await (await loadFirebase()).signOutGoogle();
+    await p2p.leaveAccount().catch(() => {});
+    if (wasGoogle) await loadFirebase().then((fb) => fb.signOutGoogle()).catch(() => {});
     toast({ tone: 'info', title: 'Signed out', body: 'Devices paired by QR code or PIN stay connected.' });
   };
 
@@ -324,15 +430,23 @@ function Shell() {
   const togglePrivate = async () => {
     if (!p2p.privateMode) {
       if (!confirm('Keep nothing on this computer?\n\nThis deletes everything qrLinkShare stored in this browser (items, pairing and this device’s identity) and reloads. From now on nothing is kept after the tab closes or reloads.')) return;
-      // Tell the other devices to forget this one: it is about to become a different device.
-      await p2p.mesh.current?.sayBye('group');
-      await p2p.mesh.current?.sayBye('account');
-      if (p2p.account?.kind === 'google') await (await loadFirebase()).signOutGoogle();
-      forgetPairing();
-      await p2p.mesh.current?.destroy();
-      await clearUserIdentity(APP_ID).catch(() => {});
-      await deleteDatabase();
-      setPrivateMode(true);
+      try {
+        // Google: sign out (best effort) and remove what it saved in this browser.
+        if (p2p.account?.kind === 'google') await loadFirebase().then((fb) => fb.signOutGoogle()).catch(() => {});
+        await clearFirebaseTraces();
+        // Tell the other devices to forget this one: it is about to become a different device.
+        await p2p.mesh.current?.sayBye('group').catch(() => {});
+        await p2p.mesh.current?.sayBye('account').catch(() => {});
+        // Switch first: other open tabs reload at once and let go of the database.
+        setPrivateMode(true);
+        forgetPairing();
+        await p2p.mesh.current?.destroy();
+        await clearUserIdentity(APP_ID).catch(() => {});
+        await deleteDatabase();
+      } finally {
+        location.reload();
+      }
+      return;
     } else {
       if (!confirm('Start keeping items on this computer again?\n\nItems in this tab right now will be cleared, and the page reloads.')) return;
       forgetPairing();
@@ -375,7 +489,16 @@ function Shell() {
 
   const keep = async (item: StoredItem) => {
     await p2p.keepForever(item.id);
-    toast({ tone: 'success', title: 'Moved to Saved', body: 'It stays on this device until you delete it.' }, 3000);
+    toast(
+      {
+        tone: 'success',
+        title: 'Moved to Saved',
+        body: safariMayDelete()
+          ? 'Kept until you delete it, but Safari deletes website data after 7 days without a visit. Back up now and then.'
+          : 'It stays on this device until you delete it.',
+      },
+      4000
+    );
   };
 
   const clear = (retention: Retention) => void p2p.removeAll(retention);
@@ -392,7 +515,9 @@ function Shell() {
               <AlertTriangle className="w-4 h-4 text-danger" /> qrLinkShare couldn’t start
             </p>
             <p className="mt-2 text-sm text-muted">
-              This browser may be too old. Update it (on iPhone: Settings → General → Software Update) or try another browser.
+              {typeof window !== 'undefined' && !window.isSecureContext
+                ? 'qrLinkShare needs a secure address. Open it with https:// (or http://localhost on this computer).'
+                : 'This browser may be too old. Update it (on iPhone: Settings → General → Software Update) or try another browser.'}
             </p>
             <p className="mt-2 text-xs text-muted break-words">{p2p.startupError}</p>
             <button type="button" className="btn btn-outline mt-4" onClick={() => location.reload()}>
@@ -446,10 +571,12 @@ function Shell() {
               compact={paired}
               joining={joining}
               onCancelJoin={cancelJoin}
+              privateMode={p2p.privateMode}
               hasPaired={p2p.hasPaired}
               onKnock={onKnock}
               onAdopt={onAdopt}
               onPaired={onPaired}
+              onCollision={onCollision}
               onEnterPin={onEnterPin}
               onScanned={onScanned}
               onGoogle={signInGoogle}
@@ -463,6 +590,8 @@ function Shell() {
               items={p2p.items}
               loading={false}
               myDeviceId={p2p.self.id}
+              online={deviceCount > 0}
+              deviceNames={p2p.deviceNames}
               freshIds={freshIds}
               progress={p2p.progress}
               autoOpen={autoOpen}
@@ -484,7 +613,17 @@ function Shell() {
           </div>
 
           <div className="lg:col-start-1 lg:row-start-2">
-            <DeviceList self={p2p.self} devices={p2p.devices} offline={p2p.knownDevices} onUnpair={unpair} />
+            <DeviceList
+              self={p2p.self}
+              devices={p2p.devices}
+              offline={p2p.knownDevices}
+              onUnpair={unpair}
+              onForget={(d) => {
+                if (confirm(`Forget ${d.name}? Use this for a device that was reset or is gone for good. It won't be sent anything any more.`)) {
+                  p2p.forgetDevice(d.id);
+                }
+              }}
+            />
           </div>
           <div className="lg:col-start-1 lg:row-start-3">
             <DevicePanel

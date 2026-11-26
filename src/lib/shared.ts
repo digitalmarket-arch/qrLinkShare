@@ -1,9 +1,11 @@
 /**
- * Pure helpers shared by the browser and the server. No DOM, no Node APIs.
+ * Pure helpers (no DOM, no network). Unit-tested in shared.test.ts.
  */
 import type { DeviceType, FileKind } from '../types/share';
 
-export const MAX_FILE_BYTES = 25 * 1024 * 1024; // 25 MB per file
+export const MAX_FILE_BYTES = 200 * 1024 * 1024; // 200 MB per file (sent directly, device to device)
+/** Temporary items disappear after this long. */
+export const TEMP_TTL_MS = 24 * 60 * 60 * 1000;
 export const MAX_TEXT_CHARS = 20_000;
 export const PIN_LENGTH = 6;
 
@@ -156,47 +158,31 @@ export function shortAddress(address: string): string {
 }
 
 /**
- * Builds a "Sign-In with Ethereum" (EIP-4361) message. The server builds this,
- * the wallet signs it, and the server checks the signature and the nonce.
+ * The fixed message a wallet signs to unlock its private room. Regular wallets
+ * always give the same signature for the same message, so every device with this
+ * wallet derives the same room key, and nobody without the wallet can.
+ * (The address is lower-cased so every wallet app produces identical text.)
  */
-export function buildWalletMessage(params: {
-  domain: string;
-  uri: string;
-  address: string;
-  chainId: number;
-  nonce: string;
-  issuedAt: string;
-  expiresAt: string;
-}): string {
+export function buildWalletRoomMessage(address: string): string {
   return [
-    `${params.domain} wants you to sign in with your Ethereum account:`,
-    params.address,
+    'qrLinkShare: unlock my private device room',
+    `Wallet: ${address.toLowerCase()}`,
     '',
-    'Sign in to qrLinkShare. Devices signed in with this wallet share files with each other in real time. This does not cost gas or give access to your funds.',
-    '',
-    `URI: ${params.uri}`,
-    'Version: 1',
-    `Chain ID: ${params.chainId}`,
-    `Nonce: ${params.nonce}`,
-    `Issued At: ${params.issuedAt}`,
-    `Expiration Time: ${params.expiresAt}`,
+    'Only sign this on qrLinkShare. Signing is free, sends no transaction and gives no access to your funds.',
   ].join('\n');
 }
 
-/** Reads the fields we care about back out of a wallet sign-in message. */
-export function parseWalletMessage(message: string): {
-  domain: string;
-  address: string;
-  nonce: string;
-  expiresAt: string;
-} | null {
-  const lines = message.split('\n');
-  const domainMatch = lines[0]?.match(/^(.+) wants you to sign in with your Ethereum account:$/);
-  const address = lines[1]?.trim() ?? '';
-  const field = (name: string) =>
-    lines.find((l) => l.startsWith(`${name}: `))?.slice(name.length + 2).trim() ?? '';
-  const nonce = field('Nonce');
-  const expiresAt = field('Expiration Time');
-  if (!domainMatch || !/^0x[0-9a-fA-F]{40}$/.test(address) || !nonce || !expiresAt) return null;
-  return { domain: domainMatch[1], address, nonce, expiresAt };
+/** Milliseconds left before a temporary item disappears (0 if expired, Infinity if saved). */
+export function msUntilExpiry(item: { retention: string; expiresAt?: string }, now = Date.now()): number {
+  if (item.retention !== 'temp' || !item.expiresAt) return Infinity;
+  return Math.max(0, new Date(item.expiresAt).getTime() - now);
+}
+
+/** "23 h", "45 min", "less than a minute". */
+export function formatTimeLeft(ms: number): string {
+  if (!Number.isFinite(ms)) return '';
+  const min = Math.floor(ms / 60_000);
+  if (min < 1) return 'less than a minute';
+  if (min < 60) return `${min} min`;
+  return `${Math.floor(min / 60)} h`;
 }

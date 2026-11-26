@@ -1,9 +1,7 @@
 name: Deploy qrLinkShare to GitHub Pages
 
-# The page on GitHub Pages talks to the live server, deployed separately on Render
-# with render.yaml (https://qrlinkshare-digitalmarket.onrender.com). To use another
-# server, set the repository variable VITE_SERVER_URL:
-# Settings → Secrets and variables → Actions → Variables.
+# The whole app is a static website: devices talk to each other directly
+# (peer to peer), so GitHub Pages is all the hosting it needs.
 
 on:
   push:
@@ -41,9 +39,7 @@ jobs:
           npm run lint
           npm test
 
-      - name: Build the page
-        env:
-          VITE_SERVER_URL: ${{ vars.VITE_SERVER_URL || 'https://qrlinkshare-digitalmarket.onrender.com' }}
+      - name: Build the site
         run: |
           npm run build
           cp dist/index.html dist/404.html

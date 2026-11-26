@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildWalletMessage,
+  buildWalletRoomMessage,
   cleanPin,
   deviceNameFromUA,
   deviceTypeFromUA,
@@ -9,7 +9,8 @@ import {
   formatBytes,
   formatPin,
   isInlineSafeMime,
-  parseWalletMessage,
+  formatTimeLeft,
+  msUntilExpiry,
   safeFileName,
   shortAddress,
   toHttpUrl,
@@ -91,23 +92,21 @@ test('device detection from user agent', () => {
   assert.equal(deviceNameFromUA(win), 'Windows · Chrome');
 });
 
-test('wallet sign-in message round-trips through the parser', () => {
-  const msg = buildWalletMessage({
-    domain: 'share.example.com',
-    uri: 'https://share.example.com',
-    address: '0x52908400098527886E0F7030069857D2E4169EE7',
-    chainId: 1,
-    nonce: 'abc123XYZ',
-    issuedAt: '2026-01-01T00:00:00.000Z',
-    expiresAt: '2026-01-01T00:05:00.000Z',
-  });
-  assert.match(msg, /^share\.example\.com wants you to sign in with your Ethereum account:\n0x5290/);
-  assert.deepEqual(parseWalletMessage(msg), {
-    domain: 'share.example.com',
-    address: '0x52908400098527886E0F7030069857D2E4169EE7',
-    nonce: 'abc123XYZ',
-    expiresAt: '2026-01-01T00:05:00.000Z',
-  });
-  assert.equal(parseWalletMessage('hello'), null);
+test('wallet room message is the same whatever address casing the wallet app uses', () => {
+  const a = buildWalletRoomMessage('0x52908400098527886E0F7030069857D2E4169EE7');
+  const b = buildWalletRoomMessage('0x52908400098527886e0f7030069857d2e4169ee7');
+  assert.equal(a, b);
+  assert.match(a, /^qrLinkShare: unlock my private device room\nWallet: 0x5290/);
   assert.equal(shortAddress('0x52908400098527886E0F7030069857D2E4169EE7'), '0x5290…9EE7');
+});
+
+test('temporary items count down; saved items never expire', () => {
+  const now = Date.parse('2026-01-01T00:00:00Z');
+  assert.equal(msUntilExpiry({ retention: 'saved' }, now), Infinity);
+  assert.equal(msUntilExpiry({ retention: 'temp', expiresAt: '2026-01-01T05:00:00Z' }, now), 5 * 3600_000);
+  assert.equal(msUntilExpiry({ retention: 'temp', expiresAt: '2025-12-31T00:00:00Z' }, now), 0);
+  assert.equal(formatTimeLeft(5 * 3600_000), '5 h');
+  assert.equal(formatTimeLeft(30 * 60_000), '30 min');
+  assert.equal(formatTimeLeft(10_000), 'less than a minute');
+  assert.equal(formatTimeLeft(Infinity), '');
 });

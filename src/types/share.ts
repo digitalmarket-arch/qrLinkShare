@@ -1,13 +1,13 @@
 /**
- * Shared types used by both the browser app and the Node server.
+ * Types for the peer-to-peer app. Everything lives on the user's own devices.
  */
 
 export type DeviceType = 'desktop' | 'mobile' | 'tablet';
 
-/** How a device got into a room. */
-export type AuthMethod = 'guest' | 'qr' | 'pin' | 'google' | 'wallet';
-
 export type ItemKind = 'text' | 'link' | 'file';
+
+/** 'temp' items disappear after 24 hours; 'saved' items stay until deleted. */
+export type Retention = 'temp' | 'saved';
 
 /** A rough visual bucket for files, derived from the MIME type / extension. */
 export type FileKind =
@@ -23,62 +23,65 @@ export type FileKind =
   | 'other';
 
 export interface DeviceInfo {
-  /** Stable random id stored in the browser (not a fingerprint). */
+  /** The device's verified peer-to-peer identity (stable per browser). */
   id: string;
   name: string;
   type: DeviceType;
 }
 
 export interface FileMeta {
-  /** Unguessable id used in the download URL (/api/files/:fileId). */
-  fileId: string;
   name: string;
   size: number;
   mime: string;
 }
 
-export interface SharedItem {
+/** What travels between devices (no local-only fields). */
+export interface WireItem {
   id: string;
-  roomId: string;
   kind: ItemKind;
-  /** Body for 'text' items. */
+  retention: Retention;
   text?: string;
-  /** Normalised http(s) URL for 'link' items. */
   url?: string;
-  /** Present for 'file' items. */
   file?: FileMeta;
   from: DeviceInfo;
   createdAt: string;
-  expiresAt: string;
+  /** Only for 'temp' items. */
+  expiresAt?: string;
 }
 
-export interface PresentDevice extends DeviceInfo {
-  method: AuthMethod;
-  joinedAt: string;
+/**
+ * - ready: complete and usable
+ * - pending: created on this device while no other device was connected; sent when one connects
+ * - receiving: a file still arriving from another device
+ * - failed: a file transfer that didn't finish
+ */
+export type ItemStatus = 'ready' | 'pending' | 'receiving' | 'failed';
+
+export interface StoredItem extends WireItem {
+  status: ItemStatus;
+  /** Local time the item was stored on this device (ms). */
+  storedAt: number;
+  /** Devices this device has delivered the item to (only for items created here). */
+  deliveredTo?: string[];
 }
 
-/** What the browser keeps in localStorage to rejoin its room. */
-export interface RoomSession {
-  roomId: string;
-  token: string;
-  method: AuthMethod;
-  /** Human label, e.g. an email or a shortened wallet address. */
-  account?: string;
+/** A device this one has been connected to before (remembered so it can catch up later). */
+export interface KnownDevice extends DeviceInfo {
+  method: LinkMethod;
+  /** Items created after this moment are delivered to it when it reconnects. */
+  since: number;
+  lastSeen: number;
 }
 
-export interface PairingCode {
-  pin: string;
-  /** Opaque token embedded in the QR code URL. */
-  pairToken: string;
-  expiresAt: string;
+/** How a connected device is linked to this one. */
+export type LinkMethod = 'paired' | 'google' | 'wallet';
+
+export interface ConnectedDevice extends DeviceInfo {
+  method: LinkMethod;
 }
 
-/** Messages the server pushes over the WebSocket. */
-export type ServerEvent =
-  | { type: 'ready'; roomId: string; items: SharedItem[]; devices: PresentDevice[] }
-  | { type: 'presence'; devices: PresentDevice[] }
-  | { type: 'item:new'; item: SharedItem }
-  | { type: 'item:removed'; itemId: string }
-  | { type: 'room:cleared' }
-  | { type: 'pair:used'; by: DeviceInfo }
-  | { type: 'error'; message: string };
+/** A signed-in account whose devices connect automatically. */
+export type Account =
+  | { kind: 'google'; uid: string; label: string }
+  /** roomKey: derived from the wallet's signature of a fixed message (only the wallet can produce it). */
+  | { kind: 'wallet'; address: string; label: string; roomKey: string };

@@ -1,8 +1,9 @@
 import { lazy, Suspense, useEffect, useState } from 'react';
-import { ChevronDown, Copy, KeyRound, QrCode as QrIcon, RefreshCw, ScanLine, Wallet } from 'lucide-react';
-import type { RoomSession } from '../types/share';
+import { ChevronDown, Copy, KeyRound, Loader2, QrCode as QrIcon, RefreshCw, ScanLine, Wallet } from 'lucide-react';
+import type { Account, DeviceInfo } from '../types/share';
+import type { Mesh } from '../lib/mesh';
 import { formatPin } from '../lib/shared';
-import { copyText, pairingLink } from '../lib/api';
+import { copyText } from '../lib/browser';
 import { usePairing } from '../hooks/usePairing';
 import { QrCode } from './QrCode';
 import { PinInput } from './PinInput';
@@ -14,36 +15,38 @@ const QrScanner = lazy(() => import('./QrScanner').then((m) => ({ default: m.QrS
 type Tab = 'show' | 'pin' | 'scan';
 
 interface Props {
-  session: RoomSession;
+  mesh: Mesh | null;
+  groupSecret: string;
+  account: Account | null;
   isMobile: boolean;
   /** Other devices are already connected, so show a compact version. */
   compact: boolean;
-  busy: boolean;
-  /** Bumped by the parent whenever a code was used, so we fetch a fresh one. */
-  refreshSignal: number;
-  onClaimPin: (pin: string) => Promise<void>;
+  /** Set while joining another device; shows what is happening. */
+  joining: string | null;
+  onKnock: (device: DeviceInfo) => Promise<boolean>;
+  onPaired: (device: DeviceInfo, via: 'qr' | 'pin') => void;
+  onEnterPin: (pin: string) => void;
   onScanned: (text: string) => void;
   onGoogle: () => void;
   onWallet: () => void;
 }
 
 export function ConnectPanel(props: Props) {
-  const { session, isMobile, compact, busy, refreshSignal } = props;
+  const { mesh, isMobile, compact, joining } = props;
   const [tab, setTab] = useState<Tab>(isMobile ? 'pin' : 'show');
   const [expanded, setExpanded] = useState(!compact);
   const toast = useToast();
 
   useEffect(() => setExpanded(!compact), [compact]);
 
-  const showing = expanded && tab === 'show';
-  const pairing = usePairing(session, showing);
-
-  useEffect(() => {
-    if (refreshSignal > 0 && showing) pairing.refresh();
-  }, [refreshSignal]);
-
-  const link = pairing.code ? pairingLink(pairing.code.pairToken) : '';
-  const isAccount = session.method === 'google' || session.method === 'wallet';
+  const showing = expanded && tab === 'show' && !joining;
+  const pairing = usePairing({
+    mesh,
+    enabled: showing,
+    groupSecret: props.groupSecret,
+    onKnock: props.onKnock,
+    onPaired: props.onPaired,
+  });
 
   const tabs: Array<{ id: Tab; label: string; icon: typeof QrIcon }> = [
     { id: 'show', label: 'Show code', icon: QrIcon },
@@ -77,9 +80,15 @@ export function ConnectPanel(props: Props) {
         )}
       </button>
 
-      {expanded && (
+      {expanded && joining && (
+        <div className="mt-5 rounded-2xl bg-surface-2 p-5 flex items-center gap-3" aria-live="polite">
+          <Loader2 className="w-5 h-5 animate-spin text-brand shrink-0" />
+          <p className="text-sm">{joining}</p>
+        </div>
+      )}
+
+      {expanded && !joining && (
         <div className="mt-5">
-          {/* Tabs */}
           <div role="tablist" aria-label="Pairing method" className="grid grid-cols-3 gap-1 p-1 rounded-xl bg-surface-2">
             {tabs.map((t) => (
               <button
@@ -101,59 +110,44 @@ export function ConnectPanel(props: Props) {
           <div className="mt-5" role="tabpanel">
             {tab === 'show' && (
               <div className="flex flex-col items-center text-center">
-                {pairing.error ? (
-                  <div className="w-full rounded-2xl bg-surface-2 p-6 text-sm text-muted">
-                    <p>{pairing.error}</p>
-                    <button type="button" className="btn btn-outline mt-4" onClick={pairing.refresh}>
-                      <RefreshCw className="w-4 h-4" /> Try again
-                    </button>
-                  </div>
-                ) : (
-                  <>
-                    <QrCode
-                      value={link || 'about:blank'}
-                      size={isMobile ? 200 : 232}
-                      label="QR code to pair another device"
-                      className={pairing.code ? '' : 'opacity-40'}
+                <QrCode value={pairing.link} size={isMobile ? 200 : 232} label="QR code to pair another device" />
+                <p className="mt-5 text-xs font-semibold uppercase tracking-wider text-muted">or enter this PIN</p>
+                <p className="mt-1 font-mono text-4xl font-semibold tracking-[0.12em] tabular-nums" aria-live="polite">
+                  {formatPin(pairing.pin)}
+                </p>
+                <div className="mt-4 w-full max-w-60">
+                  <div className="h-1 rounded-full bg-surface-2 overflow-hidden">
+                    <div
+                      className="h-full bg-brand transition-[width] duration-1000 ease-linear"
+                      style={{ width: `${pairing.fractionLeft * 100}%` }}
                     />
-                    <p className="mt-5 text-xs font-semibold uppercase tracking-wider text-muted">or enter this PIN</p>
-                    <p className="mt-1 font-mono text-4xl font-semibold tracking-[0.12em] tabular-nums" aria-live="polite">
-                      {pairing.code ? formatPin(pairing.code.pin) : '··· ···'}
-                    </p>
-                    <div className="mt-4 w-full max-w-60">
-                      <div className="h-1 rounded-full bg-surface-2 overflow-hidden">
-                        <div
-                          className="h-full bg-brand transition-[width] duration-1000 ease-linear"
-                          style={{ width: `${pairing.fractionLeft * 100}%` }}
-                        />
-                      </div>
-                      <div className="mt-2 flex items-center justify-between text-xs text-muted">
-                        <span className="tabular-nums">
-                          New code in {Math.floor(pairing.secondsLeft / 60)}:{String(pairing.secondsLeft % 60).padStart(2, '0')}
-                        </span>
-                        <span className="flex items-center gap-1">
-                          <button type="button" className="hover:text-ink cursor-pointer p-1" onClick={pairing.refresh} aria-label="New code">
-                            <RefreshCw className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            type="button"
-                            className="hover:text-ink cursor-pointer p-1"
-                            aria-label="Copy pairing link"
-                            disabled={!link}
-                            onClick={() =>
-                              copyText(link)
-                                .then(() => toast({ tone: 'success', title: 'Pairing link copied', body: 'Open it on the other device within 3 minutes.' }))
-                                .catch(() => {})
-                            }
-                          >
-                            <Copy className="w-3.5 h-3.5" />
-                          </button>
-                        </span>
-                      </div>
-                    </div>
-                    <p className="mt-4 text-xs text-muted">Each code works once and expires after 3 minutes.</p>
-                  </>
-                )}
+                  </div>
+                  <div className="mt-2 flex items-center justify-between text-xs text-muted">
+                    <span className="tabular-nums">
+                      New code in {Math.floor(pairing.secondsLeft / 60)}:{String(pairing.secondsLeft % 60).padStart(2, '0')}
+                    </span>
+                    <span className="flex items-center gap-1">
+                      <button type="button" className="hover:text-ink cursor-pointer p-1" onClick={pairing.refresh} aria-label="New code">
+                        <RefreshCw className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        className="hover:text-ink cursor-pointer p-1"
+                        aria-label="Copy pairing link"
+                        onClick={() =>
+                          copyText(pairing.link)
+                            .then(() => toast({ tone: 'success', title: 'Pairing link copied', body: 'Open it on the other device within 3 minutes.' }))
+                            .catch(() => {})
+                        }
+                      >
+                        <Copy className="w-3.5 h-3.5" />
+                      </button>
+                    </span>
+                  </div>
+                </div>
+                <p className="mt-4 text-xs text-muted max-w-xs">
+                  Keep this screen open while the other device connects. Each code works once.
+                </p>
               </div>
             )}
 
@@ -162,8 +156,7 @@ export function ConnectPanel(props: Props) {
                 <p className="text-sm text-muted mb-4">
                   On the other device, open this website and choose <b className="text-ink">Show code</b>. Then type the 6 digits here.
                 </p>
-                <PinInput disabled={busy} onComplete={(pin) => props.onClaimPin(pin)} />
-                {busy && <p className="mt-3 text-sm text-muted">Connecting…</p>}
+                <PinInput disabled={!!joining} onComplete={props.onEnterPin} />
               </div>
             )}
 
@@ -179,18 +172,17 @@ export function ConnectPanel(props: Props) {
             )}
           </div>
 
-          {/* Account sign-in */}
-          {!isAccount && (
+          {!props.account && (
             <div className="mt-6 pt-5 border-t border-line">
               <p className="text-sm font-semibold">Or sign in on both devices</p>
               <p className="text-sm text-muted mt-0.5">
-                Every device signed in to the same account connects automatically. No codes needed.
+                Your devices signed in to the same Google account or wallet find each other automatically.
               </p>
               <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2 gap-2">
-                <button type="button" className="btn btn-outline" disabled={busy} onClick={props.onGoogle}>
+                <button type="button" className="btn btn-outline" onClick={props.onGoogle}>
                   <GoogleMark /> Continue with Google
                 </button>
-                <button type="button" className="btn btn-outline" disabled={busy} onClick={props.onWallet}>
+                <button type="button" className="btn btn-outline" onClick={props.onWallet}>
                   <Wallet className="w-4 h-4" /> Connect wallet
                 </button>
               </div>

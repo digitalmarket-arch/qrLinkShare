@@ -1,83 +1,83 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { PairingCode, RoomSession } from '../types/share';
-import { api } from '../lib/api';
+import type { DeviceInfo } from '../types/share';
+import type { Mesh } from '../lib/mesh';
+import { inviteLink, randomPin, randomSecret } from '../lib/pairing';
 
 const CODE_TTL_MS = 3 * 60 * 1000;
-/** Count down a little faster than the server so we never show a code it already expired. */
-const SAFETY_MS = 3_000;
-/** Never auto-refresh more often than this, even if something about the clock is off. */
-const MIN_AUTO_REFRESH_GAP_MS = 10_000;
 
-type LocalCode = PairingCode & { localExpiresAt: number };
+interface Code {
+  invite: string;
+  pin: string;
+  expiresAt: number;
+}
+
+const freshCode = (): Code => ({ invite: randomSecret(18), pin: randomPin(), expiresAt: Date.now() + CODE_TTL_MS });
 
 /**
- * Fetches a one-time QR token + 6-digit PIN for the current room and refreshes
- * it automatically before it expires (every ~3 minutes) or after it is used.
- * The countdown uses this device's own clock from the moment the code arrived,
- * so a computer whose clock is wrong doesn't loop or show stale codes.
+ * While `enabled`, shows a one-time QR invitation + 6-digit PIN for this device and
+ * listens for a new device using either. Codes change every 3 minutes and after each use.
  */
-export function usePairing(session: RoomSession | null, enabled: boolean) {
-  const [code, setCode] = useState<LocalCode | null>(null);
-  const [error, setError] = useState<string | null>(null);
+export function usePairing(opts: {
+  mesh: Mesh | null;
+  enabled: boolean;
+  groupSecret: string;
+  onKnock: (device: DeviceInfo) => Promise<boolean>;
+  onPaired: (device: DeviceInfo, via: 'qr' | 'pin') => void;
+}) {
+  const { mesh, enabled, groupSecret } = opts;
+  const [code, setCode] = useState<Code>(freshCode);
   const [now, setNow] = useState(Date.now());
-  const loading = useRef(false);
-  const lastFetch = useRef(0);
+  const handlers = useRef(opts);
+  handlers.current = opts;
+  const secretRef = useRef(groupSecret);
+  secretRef.current = groupSecret;
 
-  const refresh = useCallback(async () => {
-    if (!session || loading.current) return;
-    loading.current = true;
-    lastFetch.current = Date.now();
-    try {
-      const c = await api.createPairing(session);
-      setCode({ ...c, localExpiresAt: Date.now() + CODE_TTL_MS - SAFETY_MS });
-      setNow(Date.now());
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not create a pairing code.');
-    } finally {
-      loading.current = false;
-    }
-  }, [session?.token]);
+  const refresh = useCallback(() => setCode(freshCode()), []);
 
+  // Listen for new devices using the current code.
   useEffect(() => {
-    setCode(null);
-    if (enabled) refresh();
-  }, [enabled, refresh]);
+    if (!mesh || !enabled) return;
+    const stop = mesh.host(
+      { invite: code.invite, pin: code.pin },
+      {
+        groupSecret: () => secretRef.current,
+        onKnock: (d) => handlers.current.onKnock(d),
+        onPaired: (d, via) => {
+          handlers.current.onPaired(d, via);
+          refresh(); // each code works once
+        },
+      }
+    );
+    return stop;
+  }, [mesh, enabled, code.invite, code.pin, refresh]);
 
-  // Tick once a second for the countdown.
+  // Countdown, and a new code when time is up (only while visible).
   useEffect(() => {
     if (!enabled) return;
-    const t = setInterval(() => setNow(Date.now()), 1000);
+    const t = setInterval(() => {
+      const n = Date.now();
+      setNow(n);
+      if (n >= code.expiresAt && document.visibilityState === 'visible') refresh();
+    }, 1000);
     return () => clearInterval(t);
-  }, [enabled]);
+  }, [enabled, code.expiresAt, refresh]);
 
-  const msLeft = code ? code.localExpiresAt - now : 0;
-  const expired = !!code && msLeft <= 0;
-
-  // Renew when time is up (only while visible, and never in a tight loop).
-  useEffect(() => {
-    if (!enabled || !expired || document.visibilityState !== 'visible') return;
-    if (Date.now() - lastFetch.current < MIN_AUTO_REFRESH_GAP_MS) return;
-    refresh();
-  }, [enabled, expired, refresh, now]);
-
-  // A hidden tab doesn't need fresh codes; renew when it becomes visible again.
+  // A code that expired while the tab was hidden is replaced when it comes back.
   useEffect(() => {
     if (!enabled) return;
     const onVisible = () => {
-      if (document.visibilityState !== 'visible') return;
-      setNow(Date.now());
-      if (code && code.localExpiresAt < Date.now() && Date.now() - lastFetch.current >= MIN_AUTO_REFRESH_GAP_MS) refresh();
+      if (document.visibilityState === 'visible' && Date.now() >= code.expiresAt) refresh();
     };
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);
-  }, [enabled, code, refresh]);
+  }, [enabled, code.expiresAt, refresh]);
 
+  const msLeft = Math.max(0, code.expiresAt - now);
   return {
-    code: expired ? null : code,
-    error,
+    pin: code.pin,
+    link: inviteLink(code.invite, { origin: location.origin, pathname: location.pathname }),
+    secondsLeft: Math.ceil(msLeft / 1000),
+    fractionLeft: msLeft / CODE_TTL_MS,
     refresh,
-    secondsLeft: Math.max(0, Math.ceil(msLeft / 1000)),
-    fractionLeft: code ? Math.max(0, Math.min(1, msLeft / CODE_TTL_MS)) : 0,
   };
 }

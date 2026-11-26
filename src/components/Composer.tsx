@@ -1,73 +1,87 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
-import { ArrowUp, Paperclip, UploadCloud, X } from 'lucide-react';
-import type { RoomSession, SharedItem } from '../types/share';
+import { ArrowUp, Bookmark, Clock, Paperclip, UploadCloud } from 'lucide-react';
+import type { Retention, StoredItem } from '../types/share';
 import { MAX_FILE_BYTES, MAX_TEXT_CHARS, formatBytes, toHttpUrl } from '../lib/shared';
-import { api, uid, uploadFile } from '../lib/api';
+import { loadPref, savePref } from '../lib/settings';
+import { safariMayDelete } from '../lib/browser';
 import { useToast } from './Toasts';
 
-interface Upload {
-  key: string;
-  name: string;
-  size: number;
-  progress: number;
-  cancel: () => void;
-}
-
 interface Props {
-  session: RoomSession;
-  peerCount: number;
-  onSent: (item: SharedItem) => void;
+  deviceCount: number;
+  /** Text to pre-fill (e.g. shared into the app from another app). */
+  initialText?: string;
+  sendText: (text: string, retention: Retention) => Promise<StoredItem | null>;
+  sendFile: (file: File, retention: Retention) => Promise<StoredItem | null>;
 }
 
-export function Composer({ session, peerCount, onSent }: Props) {
-  const [text, setText] = useState('');
+export function Composer({ deviceCount, initialText, sendText, sendFile }: Props) {
+  const [text, setText] = useState(initialText ?? '');
+  const [retention, setRetentionState] = useState<Retention>(() => loadPref<Retention>('retention', 'temp'));
   const [sending, setSending] = useState(false);
-  const [uploads, setUploads] = useState<Upload[]>([]);
   const [dragging, setDragging] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const textRef = useRef<HTMLTextAreaElement>(null);
   const toast = useToast();
-  const sessionRef = useRef(session);
-  sessionRef.current = session;
+
+  const setRetention = (r: Retention) => {
+    setRetentionState(r);
+    savePref('retention', r);
+  };
+  const retentionRef = useRef(retention);
+  retentionRef.current = retention;
+
+  useEffect(() => {
+    if (initialText) setText(initialText);
+  }, [initialText]);
 
   const isLink = !!toHttpUrl(text);
+  const tooLong = text.length > MAX_TEXT_CHARS;
 
-  const sendText = async (e?: FormEvent) => {
+  const deviceCountRef = useRef(deviceCount);
+  deviceCountRef.current = deviceCount;
+
+  /** Everything is saved on this device first and sent in the background. */
+  const notifyQueued = (stored: Array<StoredItem | null>) => {
+    if (deviceCountRef.current === 0 && stored.some(Boolean)) {
+      toast({ tone: 'info', title: 'Saved on this device', body: 'It will be sent as soon as one of your devices connects.' }, 4000);
+    }
+  };
+
+  const addFiles = async (files: FileList | File[]) => {
+    const retention = retentionRef.current; // the choice at the moment of picking applies to the whole batch
+    const stored: Array<StoredItem | null> = [];
+    for (const file of Array.from(files)) {
+      if (file.size > MAX_FILE_BYTES) {
+        toast({ tone: 'error', title: `${file.name} is too large`, body: `Max ${formatBytes(MAX_FILE_BYTES)} per file.` });
+        continue;
+      }
+      if (file.size === 0) continue;
+      try {
+        stored.push(await sendFile(file, retention));
+      } catch (err) {
+        toast({ tone: 'error', title: `${file.name} could not be saved`, body: err instanceof Error ? err.message : 'Storage may be full.' });
+      }
+    }
+    notifyQueued(stored);
+  };
+  const addFilesRef = useRef(addFiles);
+  addFilesRef.current = addFiles;
+
+  const submit = async (e?: FormEvent) => {
     e?.preventDefault();
     const value = text.trim();
     if (!value || sending) return;
-    if (value.length > MAX_TEXT_CHARS) {
-      // Very long notes travel as a .txt file instead of being cut off.
-      // The box is only cleared once the upload succeeded, so a failure loses nothing.
-      const stamp = new Date().toISOString().slice(0, 16).replace(/[T:]/g, '-');
-      const sent = text;
-      const [upload] = addFiles([new File([sent], `note-${stamp}.txt`, { type: 'text/plain' })]);
-      if (!upload) return;
-      setSending(true);
-      try {
-        const item = await upload;
-        // Only clear the box if it really arrived in the room we're in now.
-        if (item.roomId === sessionRef.current.roomId) setText((t) => (t === sent ? '' : t));
-      } catch {
-        // addFiles already showed the error toast
-      } finally {
-        setSending(false);
-        textRef.current?.focus();
-      }
-      return;
-    }
-    // The text stays in the box until we know it arrived, so nothing is ever lost.
     setSending(true);
-    const sent = text;
     try {
-      const { item } = await api.sendText(session, value);
-      if (item.roomId !== sessionRef.current.roomId) {
-        // We switched rooms while it was sending: say so and keep the text.
-        toast({ tone: 'info', title: 'Sent to the room you just left', body: 'It’s still in the box if you want to send it here too.' });
+      if (tooLong) {
+        // Very long notes travel as a .txt file instead of being cut off.
+        const stamp = new Date().toISOString().slice(0, 16).replace(/[T:]/g, '-');
+        await addFiles([new File([text], `note-${stamp}.txt`, { type: 'text/plain' })]);
       } else {
-        onSent(item);
-        setText((t) => (t === sent ? '' : t));
+        notifyQueued([await sendText(text, retention)]);
       }
+      // Saved on this device first, so it's safe to clear the box now.
+      setText((t) => (t === text ? '' : t));
     } catch (err) {
       toast({ tone: 'error', title: 'Not sent', body: err instanceof Error ? err.message : undefined });
     } finally {
@@ -83,45 +97,13 @@ export function Composer({ session, peerCount, onSent }: Props) {
     const coarse = matchMedia('(pointer: coarse)').matches;
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey || (!e.shiftKey && !coarse))) {
       e.preventDefault();
-      sendText();
+      void submit();
     }
   };
-
-  /** Starts uploading each file. Returns one promise per accepted file (rejects on failure). */
-  const addFiles = (files: FileList | File[]): Promise<SharedItem>[] => {
-    const started: Promise<SharedItem>[] = [];
-    for (const file of Array.from(files)) {
-      if (file.size > MAX_FILE_BYTES) {
-        toast({ tone: 'error', title: `${file.name} is too large`, body: `Max ${formatBytes(MAX_FILE_BYTES)} per file.` });
-        continue;
-      }
-      if (file.size === 0) continue;
-      const key = uid();
-      const { promise, cancel } = uploadFile(sessionRef.current, file, (p) =>
-        setUploads((list) => list.map((u) => (u.key === key ? { ...u, progress: p } : u)))
-      );
-      setUploads((list) => [...list, { key, name: file.name || 'Pasted file', size: file.size, progress: 0, cancel }]);
-      started.push(promise);
-      promise
-        .then((item) => {
-          if (item.roomId !== sessionRef.current.roomId) {
-            toast({ tone: 'info', title: `${file.name} was sent to the room you just left`, body: 'Send it again to share it here too.' });
-          } else onSent(item);
-        })
-        .catch((err) => {
-          if (err?.status !== -1) toast({ tone: 'error', title: `${file.name} failed`, body: err?.message });
-        })
-        .finally(() => setUploads((list) => list.filter((u) => u.key !== key)));
-    }
-    return started;
-  };
-
-  const addFilesRef = useRef(addFiles);
-  addFilesRef.current = addFiles;
 
   // Drop files anywhere on the page, or paste a screenshot with Ctrl/Cmd+V.
   useEffect(() => {
-    const addFiles = (files: FileList | File[]) => void addFilesRef.current(files);
+    const add = (files: FileList | File[]) => void addFilesRef.current(files);
     let depth = 0;
     const hasFiles = (e: DragEvent) => Array.from(e.dataTransfer?.types || []).includes('Files');
     const enter = (e: DragEvent) => {
@@ -141,7 +123,7 @@ export function Composer({ session, peerCount, onSent }: Props) {
       e.preventDefault();
       depth = 0;
       setDragging(false);
-      if (e.dataTransfer?.files.length) addFiles(e.dataTransfer.files);
+      if (e.dataTransfer?.files.length) add(e.dataTransfer.files);
     };
     const paste = (e: ClipboardEvent) => {
       const dt = e.clipboardData;
@@ -150,14 +132,14 @@ export function Composer({ session, peerCount, onSent }: Props) {
       const t = e.target as HTMLElement | null;
       const inTextField =
         !!t && (t.tagName === 'TEXTAREA' || (t.tagName === 'INPUT' && (t as HTMLInputElement).type !== 'file') || t.isContentEditable);
-      // The PIN box is for digits only, never for uploading.
+      // The PIN box is for digits only, never for sending files.
       if (t?.getAttribute('aria-label') === '6-digit PIN') return;
       // Excel/Word/Numbers copy text plus a picture of it: keep the text.
       const hasText = dt.getData('text/plain').trim().length > 0;
       const onlyImages = Array.from(files).every((f) => f.type.startsWith('image/'));
       if (inTextField && hasText && onlyImages) return;
       e.preventDefault();
-      addFiles(files);
+      add(files);
     };
     window.addEventListener('dragenter', enter);
     window.addEventListener('dragover', over);
@@ -181,9 +163,35 @@ export function Composer({ session, peerCount, onSent }: Props) {
     el.style.height = `${Math.min(el.scrollHeight, 240)}px`;
   }, [text]);
 
+  const options: Array<{ id: Retention; label: string; hint: string; icon: typeof Clock }> = [
+    { id: 'temp', label: 'Temporary', hint: 'Deleted after 24 h', icon: Clock },
+    { id: 'saved', label: 'Save', hint: safariMayDelete() ? 'Back it up (Safari)' : 'Until you delete it', icon: Bookmark },
+  ];
+
   return (
     <section aria-label="Send something" className="card p-3 sm:p-4">
-      <form onSubmit={sendText}>
+      <form onSubmit={submit}>
+        <div role="radiogroup" aria-label="Keep it for" className="grid grid-cols-2 gap-1 p-1 rounded-xl bg-surface-2 mb-3">
+          {options.map((o) => (
+            <button
+              key={o.id}
+              type="button"
+              role="radio"
+              aria-checked={retention === o.id}
+              onClick={() => setRetention(o.id)}
+              className={`min-h-11 px-2 rounded-lg text-left flex items-center gap-2 transition-colors cursor-pointer ${
+                retention === o.id ? 'bg-surface shadow-sm text-ink' : 'text-muted hover:text-ink'
+              }`}
+            >
+              <o.icon className={`w-4 h-4 shrink-0 ${retention === o.id ? 'text-brand' : ''}`} />
+              <span className="min-w-0">
+                <span className="block text-sm font-semibold leading-tight">{o.label}</span>
+                <span className="block text-[11px] leading-tight opacity-80 truncate">{o.hint}</span>
+              </span>
+            </button>
+          ))}
+        </div>
+
         <label htmlFor="composer-text" className="sr-only">
           Paste a link or type a note
         </label>
@@ -194,7 +202,7 @@ export function Composer({ session, peerCount, onSent }: Props) {
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={onKeyDown}
-          placeholder={peerCount > 0 ? 'Paste a link or type a note…' : 'Paste a link or type a note… (connect a device to send it across)'}
+          placeholder={deviceCount > 0 ? 'Paste a link or type a note…' : 'Paste a link or type a note… (sent when a device connects)'}
           className="field resize-none px-4 py-3 text-base leading-relaxed min-h-[72px]"
         />
         <div className="mt-3 flex items-center gap-2">
@@ -208,12 +216,12 @@ export function Composer({ session, peerCount, onSent }: Props) {
             multiple
             className="hidden"
             onChange={(e) => {
-              if (e.target.files) addFiles(e.target.files);
+              if (e.target.files) void addFiles(e.target.files);
               e.target.value = '';
             }}
           />
           <p className="hidden sm:block text-xs text-muted flex-1 truncate">
-            {text.length > MAX_TEXT_CHARS
+            {tooLong
               ? 'Long note: it will be sent as a .txt file.'
               : `Photos, PDFs, docs, any file up to ${formatBytes(MAX_FILE_BYTES)}. Drop or paste anywhere.`}
           </p>
@@ -225,33 +233,12 @@ export function Composer({ session, peerCount, onSent }: Props) {
         </div>
       </form>
 
-      {uploads.length > 0 && (
-        <ul className="mt-3 space-y-2" aria-label="Uploads in progress">
-          {uploads.map((u) => (
-            <li key={u.key} className="rounded-xl bg-surface-2 px-3 py-2.5">
-              <div className="flex items-center gap-3 text-sm">
-                <span className="flex-1 truncate font-medium">{u.name}</span>
-                <span className="text-xs text-muted tabular-nums">
-                  {Math.round(u.progress * 100)}% · {formatBytes(u.size)}
-                </span>
-                <button type="button" className="icon-btn w-7 h-7" aria-label={`Cancel ${u.name}`} onClick={u.cancel}>
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-              <div className="mt-2 h-1 rounded-full bg-line overflow-hidden">
-                <div className="h-full bg-brand transition-[width]" style={{ width: `${u.progress * 100}%` }} />
-              </div>
-            </li>
-          ))}
-        </ul>
-      )}
-
       {dragging && (
         <div className="fixed inset-0 z-50 p-4 sm:p-8 bg-bg/80 backdrop-blur-sm pointer-events-none">
           <div className="w-full h-full rounded-3xl border-2 border-dashed border-brand bg-brand-soft/60 flex flex-col items-center justify-center gap-3 text-center">
             <UploadCloud className="w-12 h-12 text-brand" />
             <p className="text-xl font-bold">Drop to send</p>
-            <p className="text-sm text-muted">Files go to every device in this room</p>
+            <p className="text-sm text-muted">{retention === 'saved' ? 'Saved on your devices' : 'Temporary: deleted after 24 hours'}</p>
           </div>
         </div>
       )}

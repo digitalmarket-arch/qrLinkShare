@@ -2,11 +2,12 @@
  * Web3 wallet sign-in (MetaMask, Coinbase Wallet, Trust, Rabby, Brave…).
  *
  * Uses the standard browser wallet API (EIP-1193) and wallet discovery (EIP-6963).
- * Signing a message proves you own the address. It costs no gas and gives
- * this site no access to your funds.
+ * The wallet signs ONE fixed message. The signature (which only this wallet can
+ * make, and which is the same on every device) unlocks a private room for the
+ * wallet's devices. Signing is free (no gas) and gives this site no access to funds.
  */
-import { api } from './api';
-import type { RoomSession } from '../types/share';
+import { buildWalletRoomMessage } from './shared';
+import { sha256Hex } from './pairing';
 
 interface Eip1193Provider {
   request(args: { method: string; params?: unknown[] }): Promise<unknown>;
@@ -62,20 +63,21 @@ function utf8ToHex(text: string): string {
   return '0x' + Array.from(new TextEncoder().encode(text), (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-/** Full sign-in: connect → ask server for a message → sign it → server verifies. */
-export async function signInWithWallet(wallet: WalletOption): Promise<RoomSession> {
+/** Asks the wallet to sign the fixed message and derives the private room key from it. */
+export async function unlockWalletRoom(wallet: WalletOption): Promise<{ address: string; roomKey: string }> {
   const accounts = (await wallet.provider.request({ method: 'eth_requestAccounts' })) as string[];
   const address = accounts?.[0];
-  if (!address) throw new Error('No wallet account was shared.');
-  const chainHex = (await wallet.provider.request({ method: 'eth_chainId' }).catch(() => '0x1')) as string;
-  const chainId = parseInt(chainHex, 16) || 1;
-
-  const { message } = await api.walletChallenge(address, chainId);
+  if (!address || !/^0x[0-9a-fA-F]{40}$/.test(address)) throw new Error('No wallet account was shared.');
+  const message = buildWalletRoomMessage(address);
   const signature = (await wallet.provider.request({
     method: 'personal_sign',
     params: [utf8ToHex(message), address],
   })) as string;
-  return api.walletVerify(message, signature);
+  if (typeof signature !== 'string' || !/^0x[0-9a-fA-F]{130}$/.test(signature)) {
+    throw new Error('This wallet type isn’t supported. Use a regular wallet such as MetaMask, Trust or Rabby.');
+  }
+  // Only a hash of the signature is kept; the signature itself is never stored or sent.
+  return { address, roomKey: await sha256Hex(`qrls/wallet-room/${signature.toLowerCase()}`) };
 }
 
 /** Wallet errors are cryptic; turn the common ones into plain English. */

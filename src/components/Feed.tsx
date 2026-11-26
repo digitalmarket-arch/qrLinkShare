@@ -1,34 +1,64 @@
 import { useMemo, useState } from 'react';
-import { Inbox, QrCode, Send, Smartphone } from 'lucide-react';
-import type { SharedItem } from '../types/share';
+import { Bookmark, Clock, QrCode, Send, Smartphone } from 'lucide-react';
+import type { Retention, StoredItem } from '../types/share';
 import { ItemCard } from './ItemCard';
+import { loadPref, savePref } from '../lib/settings';
+import { safariMayDelete } from '../lib/browser';
 
 type Filter = 'all' | 'link' | 'file' | 'text';
 
 interface Props {
-  items: SharedItem[];
+  items: StoredItem[];
   loading: boolean;
   myDeviceId: string;
   freshIds: Set<string>;
+  progress: Record<string, number>;
+  online: boolean;
+  deviceNames: Record<string, string>;
   autoOpen: boolean;
   onToggleAutoOpen: () => void;
+  getBlob: (id: string) => Promise<Blob | undefined>;
   onCopy: (text: string, what: string) => void;
-  onShowQr: (item: SharedItem) => void;
-  onDelete: (item: SharedItem) => void;
-  onClearAll: () => void;
+  onShowQr: (item: StoredItem) => void;
+  onKeep: (item: StoredItem) => void;
+  onDelete: (item: StoredItem) => void;
+  onRetry: (item: StoredItem) => void;
+  onClear: (retention: Retention) => void;
+  onProblem: (message: string) => void;
 }
+
+const newestFirst = (a: StoredItem, b: StoredItem) => b.createdAt.localeCompare(a.createdAt);
 
 export function Feed(props: Props) {
   const { items, loading } = props;
+  const [section, setSectionState] = useState<Retention>(() => loadPref<Retention>('section', 'temp'));
   const [filter, setFilter] = useState<Filter>('all');
+  const setSection = (s: Retention) => {
+    setSectionState(s);
+    setFilter('all');
+    savePref('section', s);
+  };
 
+  const bySection = useMemo(
+    () => ({
+      temp: items.filter((i) => i.retention === 'temp').sort(newestFirst),
+      saved: items.filter((i) => i.retention === 'saved').sort(newestFirst),
+    }),
+    [items]
+  );
+  const list = bySection[section];
   const counts = useMemo(() => {
-    const c = { all: items.length, link: 0, file: 0, text: 0 };
-    for (const i of items) c[i.kind]++;
+    const c = { all: list.length, link: 0, file: 0, text: 0 };
+    for (const i of list) c[i.kind]++;
     return c;
-  }, [items]);
+  }, [list]);
+  const visible = filter === 'all' ? list : list.filter((i) => i.kind === filter);
 
-  const visible = filter === 'all' ? items : items.filter((i) => i.kind === filter);
+  const safari = useMemo(safariMayDelete, []);
+  const sections: Array<{ id: Retention; label: string; icon: typeof Clock; hint: string }> = [
+    { id: 'temp', label: 'Temporary', icon: Clock, hint: 'Deleted after 24 h' },
+    { id: 'saved', label: 'Saved', icon: Bookmark, hint: safari ? 'Back them up (Safari)' : 'Until you delete them' },
+  ];
   const filters: Array<{ id: Filter; label: string }> = [
     { id: 'all', label: 'All' },
     { id: 'link', label: 'Links' },
@@ -37,32 +67,34 @@ export function Feed(props: Props) {
   ];
 
   return (
-    <section aria-labelledby="feed-title">
-      <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
-        <h2 id="feed-title" className="text-lg font-bold">
-          Shared items{' '}
-          {items.length > 0 && <span className="text-muted font-semibold tabular-nums">({items.length})</span>}
-        </h2>
-        <label className="flex items-center gap-2 text-sm text-muted cursor-pointer select-none">
-          <span>Auto-open links</span>
+    <section aria-label="Your items">
+      <div role="tablist" aria-label="Sections" className="grid grid-cols-2 gap-2 mb-4">
+        {sections.map((s) => (
           <button
+            key={s.id}
             type="button"
-            role="switch"
-            aria-checked={props.autoOpen}
-            onClick={props.onToggleAutoOpen}
-            className={`relative w-10 h-6 rounded-full transition-colors cursor-pointer ${props.autoOpen ? 'bg-brand' : 'bg-line'}`}
+            role="tab"
+            aria-selected={section === s.id}
+            onClick={() => setSection(s.id)}
+            className={`card px-3 sm:px-4 py-3 text-left flex items-center gap-2.5 sm:gap-3 cursor-pointer transition-colors ${
+              section === s.id ? '!border-brand ring-2 ring-[var(--ring)]' : 'hover:bg-surface-2'
+            }`}
           >
-            <span
-              className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform ${
-                props.autoOpen ? 'translate-x-4' : ''
-              }`}
-            />
+            <span className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 ${section === s.id ? 'bg-brand text-brand-ink' : 'bg-surface-2 text-muted'}`}>
+              <s.icon className="w-4 h-4" />
+            </span>
+            <span className="min-w-0">
+              <span className="block font-bold leading-tight whitespace-nowrap">
+                {s.label} <span className="text-muted font-semibold tabular-nums">({bySection[s.id].length})</span>
+              </span>
+              <span className="block text-xs text-muted truncate">{s.hint}</span>
+            </span>
           </button>
-        </label>
+        ))}
       </div>
 
-      {items.length > 0 && (
-        <div className="flex items-center gap-1.5 mb-3 overflow-x-auto -mx-1 px-1 pb-1">
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+        <div className="flex items-center gap-1.5 overflow-x-auto -mx-1 px-1 pb-1">
           {filters.map((f) => (
             <button
               key={f.id}
@@ -77,18 +109,20 @@ export function Feed(props: Props) {
               {f.id !== 'all' && counts[f.id] > 0 && <span className="ml-1 opacity-60 tabular-nums">{counts[f.id]}</span>}
             </button>
           ))}
-          <span className="flex-1" />
+        </div>
+        <label className="flex items-center gap-2 text-sm text-muted cursor-pointer select-none">
+          <span>Auto-open links</span>
           <button
             type="button"
-            className="shrink-0 text-sm font-semibold text-muted hover:text-danger px-2 min-h-9 cursor-pointer"
-            onClick={() => {
-              if (confirm('Delete every item in this room for all devices?')) props.onClearAll();
-            }}
+            role="switch"
+            aria-checked={props.autoOpen}
+            onClick={props.onToggleAutoOpen}
+            className={`relative w-10 h-6 rounded-full transition-colors cursor-pointer ${props.autoOpen ? 'bg-brand' : 'bg-line'}`}
           >
-            Clear all
+            <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform ${props.autoOpen ? 'translate-x-4' : ''}`} />
           </button>
-        </div>
-      )}
+        </label>
+      </div>
 
       {loading ? (
         <ul className="space-y-3" aria-busy="true">
@@ -96,8 +130,8 @@ export function Feed(props: Props) {
             <li key={i} className="card h-28 animate-pulse" />
           ))}
         </ul>
-      ) : items.length === 0 ? (
-        <EmptyState />
+      ) : list.length === 0 ? (
+        <EmptyState section={section} />
       ) : visible.length === 0 ? (
         <p className="card p-8 text-center text-sm text-muted">Nothing here in this category yet.</p>
       ) : (
@@ -108,46 +142,77 @@ export function Feed(props: Props) {
               item={item}
               myDeviceId={props.myDeviceId}
               fresh={props.freshIds.has(item.id)}
+              progress={props.progress[item.id]}
+              online={props.online}
+              deviceNames={props.deviceNames}
+              getBlob={props.getBlob}
               onCopy={props.onCopy}
               onShowQr={props.onShowQr}
+              onKeep={props.onKeep}
               onDelete={props.onDelete}
+              onRetry={props.onRetry}
+              onProblem={props.onProblem}
             />
           ))}
         </ul>
       )}
 
-      {items.length > 0 && (
-        <p className="mt-4 text-center text-xs text-muted">Items disappear automatically after 24 hours.</p>
+      {list.length > 0 && (
+        <div className="mt-4 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-muted">
+          <span>
+            {section === 'temp'
+              ? 'Temporary items are deleted 24 hours after they were sent (on a device where qrLinkShare is closed, the next time it opens).'
+              : safari
+                ? 'Saved items stay until you delete them, but Safari deletes website data after 7 days of not visiting. Back up (Your data → Backup), or install qrLinkShare (Home Screen / Dock).'
+                : 'Saved items stay on this device until you delete them.'}
+          </span>
+          <button
+            type="button"
+            className="font-semibold hover:text-danger px-2 min-h-9 cursor-pointer"
+            onClick={() => {
+              const what = section === 'temp' ? 'all temporary items' : 'all saved items';
+              if (confirm(`Delete ${what} from this device? Other devices keep their own copies.`)) props.onClear(section);
+            }}
+          >
+            {section === 'temp' ? 'Clear temporary' : 'Delete all saved'}
+          </button>
+        </div>
       )}
     </section>
   );
 }
 
-function EmptyState() {
+function EmptyState({ section }: { section: Retention }) {
   const steps = [
     { icon: QrCode, title: 'Pair', body: 'Scan the QR code or type the PIN on your other device.' },
     { icon: Send, title: 'Send', body: 'Paste a link, write a note, or drop any file.' },
-    { icon: Smartphone, title: 'Done', body: 'It shows up on every paired device instantly.' },
+    { icon: Smartphone, title: 'Done', body: 'It goes straight to your other device. No server in between.' },
   ];
   return (
     <div className="card p-6 sm:p-8 text-center">
       <div className="mx-auto w-12 h-12 rounded-2xl bg-brand-soft text-brand flex items-center justify-center">
-        <Inbox className="w-6 h-6" />
+        {section === 'temp' ? <Clock className="w-6 h-6" /> : <Bookmark className="w-6 h-6" />}
       </div>
-      <p className="mt-4 font-bold">Nothing shared yet</p>
-      <p className="mt-1 text-sm text-muted">Anything you send here appears on your other devices in real time.</p>
-      <ol className="mt-6 grid grid-cols-1 sm:grid-cols-3 gap-3 text-left">
-        {steps.map((s, i) => (
-          <li key={s.title} className="rounded-2xl bg-surface-2 p-4">
-            <div className="flex items-center gap-2">
-              <span className="w-6 h-6 rounded-full bg-ink text-bg text-xs font-bold flex items-center justify-center">{i + 1}</span>
-              <s.icon className="w-4 h-4 text-muted" />
-              <span className="font-semibold text-sm">{s.title}</span>
-            </div>
-            <p className="mt-2 text-sm text-muted">{s.body}</p>
-          </li>
-        ))}
-      </ol>
+      <p className="mt-4 font-bold">{section === 'temp' ? 'No temporary items' : 'Nothing saved yet'}</p>
+      <p className="mt-1 text-sm text-muted">
+        {section === 'temp'
+          ? 'Quick hand-offs land here and are deleted after 24 hours.'
+          : 'Choose “Save” when sending, or tap the bookmark on any temporary item, to keep it here.'}
+      </p>
+      {section === 'temp' && (
+        <ol className="mt-6 grid grid-cols-1 sm:grid-cols-3 gap-3 text-left">
+          {steps.map((s, i) => (
+            <li key={s.title} className="rounded-2xl bg-surface-2 p-4">
+              <div className="flex items-center gap-2">
+                <span className="w-6 h-6 rounded-full bg-ink text-bg text-xs font-bold flex items-center justify-center">{i + 1}</span>
+                <s.icon className="w-4 h-4 text-muted" />
+                <span className="font-semibold text-sm">{s.title}</span>
+              </div>
+              <p className="mt-2 text-sm text-muted">{s.body}</p>
+            </li>
+          ))}
+        </ol>
+      )}
     </div>
   );
 }

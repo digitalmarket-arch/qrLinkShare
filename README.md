@@ -1,34 +1,81 @@
 # qrLinkShare
 
-**Send links, photos, PDFs, documents and notes between your phone and computer, in real time, in both directions.** No app, no cable, no emailing yourself.
+**Send links, photos, PDFs, documents and notes between your phone and computer, directly from one device to the other.** No app to install, no cable, no emailing yourself, and **nothing you share is stored on any server**.
+
+Live site: **https://digitalmarket-arch.github.io/qrLinkShare/**
 
 ## How it works
 
 1. Open the site on your computer. It shows a **QR code** and a **6-digit PIN**.
-2. On your phone, scan the QR code with the normal camera app, **or** open the site and type the PIN.
-3. Both devices are now in the same private "room". Anything you send from one appears on the other instantly.
+2. On your phone, scan the QR code with the camera app, **or** open the site and type the PIN. With a PIN, both screens then show the same **4-digit security code**: check that they match, tap **It matches** on the phone and **Allow** on the computer.
+3. The two devices are now paired. Anything you send from one appears on the other, both ways.
+4. Next time, just open the site on both. Paired devices find each other automatically.
+
+**Adding more devices:** pair the new device with *any* of your devices (scan or type the code shown on either one). All your paired devices end up in one group, and nobody is disconnected.
+
+**Pairing is for your own devices.** It connects all of them into one group. To give a link or note to someone else, don't pair: show them the item's QR code instead. A phone that already has paired devices asks before pairing with another device.
 
 Other ways to connect:
 
 | Method | How | Best for |
 | --- | --- | --- |
 | **QR code** | Scan the code on the other screen | Phone ↔ computer, fastest |
-| **6-digit PIN** | Type the PIN shown on the other screen | No camera, or the computer is far away |
-| **Scan in-app** | "Scan" tab uses this device's camera | Computer with webcam scanning a phone's code |
-| **Google** | Sign in with the same Google account on both devices | Your own devices, no codes every time |
-| **Web3 wallet** | Connect the same wallet (MetaMask, Coinbase, Trust, Rabby…) on both | Crypto users; no email needed |
+| **6-digit PIN** | Type the PIN shown on the other screen, compare the security code, approve | No camera, or the screen is far away |
+| **Scan in-app** | "Scan" tab uses this device's camera | Computer with a webcam scanning a phone |
+| **Google** | Sign in with the same Google account on both devices (the first time, confirm a code on both) | Your own devices, no typing |
+| **Web3 wallet** | Connect the same wallet (MetaMask, Trust, Rabby, Coinbase Wallet…) on both | Crypto users, no email needed |
 
-Signing in with Google or a wallet puts every device on that account in one shared room automatically.
+Codes change every 3 minutes and after each use. A PIN also changes after any attempt that doesn't pair, and a QR code after the other device says no. A code that has expired is refused, even if the screen showing it was left open in the background.
 
-## Features
+## Two sections: Temporary and Saved
 
-- Real-time sync over WebSockets, so items appear in under a second
-- Any file type up to 25 MB, with upload progress. Drag-and-drop, or paste screenshots with Ctrl/Cmd+V
-- Links are detected automatically and can **auto-open** on the computer
-- Every item has its own QR code, so a phone that isn't paired can still grab it
-- Image thumbnails, PDF preview, copy and share buttons, delete for everyone
-- Light and dark mode, works on phones, tablets and desktops
-- Items **auto-delete after 24 hours**
+When you send something, choose:
+
+- **Temporary**: for quick hand-offs. It is deleted **24 hours** after it was sent. (On a device where qrLinkShare is closed, that happens the next time it's opened there. On shared computers, use *Keep nothing on this computer*.)
+- **Save**: for things you want to keep. It stays on your devices **until you delete it**.
+
+You can move any temporary item to Saved with the bookmark button.
+
+## Where is my data?
+
+- **Only on your devices**, in the browser's own storage (IndexedDB). The site itself is a static page on GitHub Pages and stores nothing.
+- Devices connect **directly** (WebRTC, encrypted end to end). Links, notes and files never pass through a server.
+- To find each other, devices send a tiny **encrypted** "here I am" message through free public relays (the Nostr network, via the open-source [Trystero](https://github.com/dmotz/trystero) library). The relays can't read it, don't keep it, and never see what you share.
+- To connect across different networks (say, phone on mobile data, computer on Wi-Fi), each device asks a public address service (Cloudflare's STUN server) for its own internet address. It sees the device's IP address, never what is sent.
+- **Delivery receipts:** an item counts as delivered only when the other device confirms it has saved it. If a device drops off half-way, the item stays *Waiting to send* and goes out automatically when that device is back.
+- **Android share menu:** when you share a link into the installed app, it stays on the phone; it is not sent to the website. (This works once the installed app has been opened online at least once. On its very first launch, or after its site data was cleared, the shared text is part of the address the browser asks the website for, and could appear in GitHub's logs.)
+- **"Keep nothing on this computer"** (in *Your data*): for shared or office PCs. Nothing is saved, not even the pairing: closing, reopening or reloading the tab starts from scratch.
+- **Backup / Restore** (in *Your data*): because there's no server copy, your Saved items exist only on your devices. Download a backup now and then. It's a standard `.tar` archive (most archive tools open it), and it isn't encrypted, so keep it safe.
+
+### Good to know
+
+- **Both devices must be online with the page open** to exchange things. If you send while the other device is away, the item waits on your device and is delivered when it comes back.
+- **Same Wi-Fi works best.** Across different networks it usually works too, but some strict networks (some office firewalls and mobile data providers) block direct connections. If two devices see each other but nothing arrives, put them on the same Wi-Fi.
+- **iPhone / iPad (and Safari on Mac):** Safari deletes a website's data (Saved items and pairing) after 7 days of using Safari without opening the site. On a Mac, back up now and then, use another browser, or add qrLinkShare to the Dock (File → Add to Dock).
+  On iPhone/iPad, add qrLinkShare to your Home Screen (Share → *Add to Home Screen*) **before** you start saving things, and always open it from there. The Home Screen app has its own storage: it starts empty and unpaired, and pairing it again does not copy old items. Already have Saved items in Safari? First tap *Your data → Backup* in Safari, then add the app to the Home Screen, open it, tap *Your data → Restore*, choose the backup file, and pair it again (use *Enter PIN* or the in-app *Scan* tab; scanning with the Camera app pairs Safari, not the Home Screen app).
+- **Android:** install it (browser menu → *Install app*) and qrLinkShare appears in the **Share** menu of other apps, so you can share a link from any app straight to your computer.
+- Max file size: **200 MB**. Works in current Chrome, Edge, Firefox and Safari (iPhone/iPad: iOS 15.4 or newer).
+
+## Security, in plain words
+
+- Each group of paired devices shares a long random secret. QR codes and PINs are **one-time invitations** valid for 3 minutes; the secret itself is handed over only inside the encrypted device-to-device connection.
+- A QR code carries a long random invitation nobody can guess.
+- A PIN is short, and someone watching the public relays could work out which PIN is in use. That's why PIN pairing shows a **security code** on both screens. The code is made from both devices' ids and from random numbers each device commits to before seeing the other's, so nobody can choose it: someone trying to sit in between has a 1-in-10,000 chance per attempt of making the two screens match.
+  - Every attempt that doesn't finish uses up the PIN, a new one is shown, and you're told. After three such attempts in 10 minutes, PIN pairing pauses (the QR code keeps working).
+  - If two devices use the same PIN at once, both are refused.
+  - Each device shares its pairing as soon as you confirm on it, so compare the codes before tapping either button.
+  - If the device that typed the PIN gives up, the question disappears by itself.
+- **Unpair** tells your other devices that are online at that moment, so they forget this one. A device that was offline then keeps showing it as "Offline"; remove it there with the **×** (Forget) next to it.
+- **Forget** only removes a device from the list. If that device still has qrLinkShare (a lost phone, say), it reconnects the next time it's opened. To shut a lost or stolen device out, tap **Unpair this device** on each of your other devices, then pair them with each other again, and sign out of Google or the wallet there if you linked one.
+- **Wallet sign-in**: your wallet signs one fixed message (free, no transaction). Only your wallet can make that signature, and it's the same on all your devices, so they meet in a private room nobody else can find, even someone who knows your wallet address. (Use a regular wallet; smart-contract wallets aren't supported.)
+- **Google sign-in** is the convenient option:
+  - Your devices meet in a room based on your Google account's internal id.
+  - The first time two of your devices meet, both ask *Is this your device?* and show the same 4-digit security code. Check it and tap **Allow** on both. After that they reconnect by themselves. The code comparison is what protects you; devices that keep starting the check without finishing it pause new connections for 10 minutes.
+  - Each device also checks the other's Google sign-in token, on the device, against Google's public keys. It must come from that device's own sign-in, not be one handed back. A device only shows its token to devices you allowed, so a device you allow receives this device's Google token.
+  - Like any Google sign-in, Firebase (Google's sign-in service used here) keeps a sign-in record: your account id, email, name and sign-in times. Nothing you share is stored there.
+  - Someone who learns your account's internal id could make your devices show the *Is this your device?* question. If you didn't expect it, tap **Don't allow**.
+  - Google sign-in is turned off in *Keep nothing on this computer* mode, because it would leave the browser signed in to Google for the next person. Signing out of qrLinkShare doesn't sign the browser out of Google; on a shared computer, also sign out at accounts.google.com.
+- Nothing you share is ever uploaded anywhere (see the Android share note above for the one exception).
 
 ## Run it on your computer
 
@@ -36,93 +83,37 @@ You need [Node.js](https://nodejs.org) 20 or newer.
 
 ```bash
 npm install
-npm run dev          # opens on http://localhost:3000
+npm run dev        # serves on http://localhost:3000 (a phone needs https://, e.g. through an https tunnel)
+npm test           # unit tests
+npm run lint       # type-check
+npm run build      # production files in dist/
 ```
 
-To test with your phone, both devices must be on the same Wi-Fi. Open `http://<your-computer's-IP>:3000` on the computer (not `localhost`) so the QR code contains an address your phone can reach. Note: the in-app camera scanner and copy buttons need **https**, but the phone's normal camera app works fine over plain http.
+## Deploy
 
-Other commands:
+Every push to `main` publishes the site to GitHub Pages automatically (`.github/workflows/deploy.yml`). There is no server to run.
 
-```bash
-npm run lint         # type-check
-npm test             # unit tests
-npm run build && npm start          # production mode
-BASE=http://localhost:3000 npm run check:api   # API & security checks against a running server
-```
+**Google sign-in** needs one setting in the [Firebase console](https://console.firebase.google.com) (project in `firebase-applet-config.json`): **Authentication → Settings → Authorized domains → add `digitalmarket-arch.github.io`**, and make sure **Sign-in method → Google** is enabled.
 
-## Deploy (put it on the internet)
-
-The site has two parts:
-
-- **The page** (what people see) lives on **GitHub Pages**: `https://digitalmarket-arch.github.io/qrLinkShare/`
-- **The live server** (what passes files between devices in real time) lives on **Render**, free plan. GitHub Pages can only host static pages, so it can't do this part.
-
-### One-time setup (about 15 minutes)
-
-**Step 1: Start the server on Render**
-1. Go to [render.com](https://render.com) and sign up with your GitHub account.
-2. Click **New → Blueprint**, pick **digitalmarket-arch/qrLinkShare**, then **Apply**. `render.yaml` already has every setting (Singapore region, closest to India; a random secret; permission for the GitHub Pages address).
-3. Wait 3-5 minutes until it says **Live**. Its address should be `https://qrlinkshare-digitalmarket.onrender.com`. That's the address the GitHub Pages site already uses.
-
-**Step 2: The page on GitHub Pages**
-It publishes automatically on every push to `main` (Actions tab → "Deploy qrLinkShare to GitHub Pages"), at `https://digitalmarket-arch.github.io/qrLinkShare/`. GitHub Pages must use **Settings → Pages → Source: GitHub Actions**.
-
-If Render gave your server a different address, set the repository variable `VITE_SERVER_URL` to it (Settings → Secrets and variables → Actions → Variables), then re-run the workflow.
-
-**Step 3: Allow Google sign-in on the new address.** See "Google sign-in setup" below. Add `digitalmarket-arch.github.io`.
-
-### Free plan caveats
-- The server sleeps after 15 minutes without visitors. The next visitor sees "Waking up the server…" for up to a minute. Because files are kept in memory, a sleep or restart also clears shared items.
-- It has 512 MB of RAM, so `render.yaml` caps stored items at 150 MB in total (`MAX_STORE_MB`) and 60 MB per person (`MAX_USER_MB`). When the server is full, new uploads are politely refused until old items expire.
-- A paid Render plan (about $7/month) removes both limits. You can then raise `MAX_STORE_MB`.
-
-The Render address also works on its own as a complete copy of the site. Any Node host that supports WebSockets works the same way (Railway, Fly.io, a VPS). On those hosts, also set `PUBLIC_ORIGIN` to your site's address, otherwise wallet sign-in is switched off for safety. If you use a different GitHub Pages address (another account or a custom domain), add it to `ALLOWED_ORIGINS` on the server, e.g. `*,https://yourname.github.io`.
-
-### Google sign-in setup
-
-Google login uses Firebase Authentication (project settings in `firebase-applet-config.json`). In the [Firebase console](https://console.firebase.google.com):
-
-1. **Authentication → Sign-in method** → enable **Google**.
-2. **Authentication → Settings → Authorized domains** → add `digitalmarket-arch.github.io` and your Render domain (`qrlinkshare-digitalmarket.onrender.com`).
-
-To use your own Firebase project, replace the values in `firebase-applet-config.json`. The Firebase web config is meant to be public. The server checks every Google token itself.
-
-### Wallet sign-in
-
-There's nothing to set up. It uses the standard browser wallet API (EIP-1193 / EIP-6963) and "Sign-In with Ethereum" (EIP-4361) messages. Signing is free (no gas) and gives the site no access to funds. On phones without a wallet extension, the app offers links that open the site inside MetaMask, Coinbase Wallet or Trust Wallet.
-
-## Environment variables
-
-See `.env.example`. The important ones:
-
-- **`SERVER_SECRET`**: without it, a random secret is used and every device has to pair again after a restart.
-- **`PUBLIC_ORIGIN`**: your site's address, e.g. `https://share.example.com`. Wallet sign-in messages only ever name this address. It's **required for wallet sign-in** on a VPS, Railway, Fly or behind nginx. It's not needed on Render (detected automatically) or when testing on localhost / your home Wi-Fi.
-- **`MAX_STORE_MB`** / **`MAX_ROOM_MB`** / **`MAX_USER_MB`** / **`UPLOAD_MB_PER_HOUR`**: memory limits for shared items. Note that "per user" is really "per IP address". On mobile data in India, many people can share one IP (carrier-grade NAT), so don't set `MAX_USER_MB` too low.
-
-## Privacy & security, in plain words
-
-- Each room is private. A device can only join with a fresh one-time QR/PIN (valid 3 minutes), or by signing in to the same account. PIN guessing is rate-limited.
-- Wallet sign-in messages always name this website, and the server only accepts the exact message it issued. A different website can't reuse them to get into your wallet's room.
-- Files and notes are stored **on the server, in memory, for 24 hours** and are then deleted. They are encrypted in transit (https) but **not end-to-end encrypted**: whoever runs the server could technically read them. Don't use it for passwords or highly sensitive documents.
-- File download links contain a long random key. Anyone who has the link (or scans an item's QR code) can download that file until it expires.
-- Uploaded files can never run code on the site: risky types (HTML, SVG…) are always downloaded, never displayed.
+Optional build settings (own relays, other STUN servers, a TURN server for very strict networks) are described in `.env.example`.
 
 ## Project layout
 
 ```
-server.ts            Express API + WebSocket hub + serves the app
-server/
-  tokens.ts          signed room-access tokens, random ids & PINs
-  auth.ts            Google token + wallet signature verification
-  store.ts           in-memory rooms, items, files, pairing codes (auto-expiry)
 src/
-  App.tsx            app shell & all user actions
-  hooks/useRoom.ts   live WebSocket connection to the room
-  hooks/usePairing.ts  auto-refreshing QR/PIN
-  components/        UI (ConnectPanel, Composer, Feed, ItemCard, …)
-  lib/api.ts         talks to the server
-  lib/wallet.ts      Web3 wallet sign-in
-  lib/firebase.ts    Google sign-in
-  lib/shared.ts      helpers shared by server and browser (+ tests)
-scripts/api-check.ts end-to-end API & security checks
+  App.tsx              the screen: pairing, sending, sections, settings
+  hooks/useP2P.ts      storage + delivery (per-device outbox with receipts, catch-up)
+  hooks/usePairing.ts  rotating QR invitation + PIN
+  lib/mesh.ts          peer-to-peer engine (rooms, hello/verification, receipts, group moves)
+  lib/pairing.ts       secrets, invitations, room derivation
+  lib/db.ts            on-device storage (IndexedDB, or memory in "keep nothing" mode)
+  lib/verify.ts        Google sign-in check (on the device)
+  lib/wallet.ts        wallet connection and private room key
+  lib/backup.ts        backup / restore of Saved items (.tar)
+  lib/shareTarget.ts   text shared in from other apps (Android)
+  lib/linkify.ts       clickable links inside notes
+  polyfills.ts         small stand-ins so older iPhones work
+  components/          UI pieces (Composer, Feed, ItemCard, ConnectPanel, …)
+sw/sw.js               offline service worker (the build adds the file list and version)
+public/                icons, web-app manifest
 ```

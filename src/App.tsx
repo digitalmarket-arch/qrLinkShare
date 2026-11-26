@@ -1,30 +1,50 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Loader2, RefreshCw, ServerCrash } from 'lucide-react';
-import type { DeviceInfo, RoomSession, SharedItem } from './types/share';
-import { ApiError, api, copyText, getDevice, loadPref, loadSession, saveSession, savePref } from './lib/api';
-import { signInWithWallet, walletErrorMessage, type WalletOption } from './lib/wallet';
-import { useRoom } from './hooks/useRoom';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { AlertTriangle, Loader2 } from 'lucide-react';
+import { clearUserIdentity } from 'trystero';
+import type { Account, DeviceInfo, LinkMethod, Retention, StoredItem } from './types/share';
+import { copyText, downloadBlob, openInNewTab, safariMayDelete } from './lib/browser';
+import { loadPref, savePref, setPrivateMode, forgetPairing } from './lib/settings';
+import { APP_ID, parseInviteLink, randomSecret } from './lib/pairing';
+import { cleanPin, shortAddress } from './lib/shared';
+import { deleteDatabase, deleteNamedDatabase } from './lib/db';
+import { createBackup, restoreBackup } from './lib/backup';
+import { unlockWalletRoom, walletErrorMessage, type WalletOption } from './lib/wallet';
+import { extractLinks } from './lib/linkify';
+import { takeSharedText } from './lib/shareTarget';
+import type { JoinStatus, SpentReason } from './lib/mesh';
+import { useP2P, type IncomingNotice } from './hooks/useP2P';
 import { ToastProvider, useToast } from './components/Toasts';
 import { Header, Logo, type Theme } from './components/Header';
-import { ConnectPanel } from './components/ConnectPanel';
+import { ConnectPanel, type JoinUi } from './components/ConnectPanel';
 import { DeviceList } from './components/DeviceList';
+import { DevicePanel } from './components/DevicePanel';
 import { Composer } from './components/Composer';
 import { Feed } from './components/Feed';
 import { ItemQrModal } from './components/ItemQrModal';
+import { KnockModal, type Knock } from './components/KnockModal';
 import { WalletModal } from './components/WalletModal';
 
 type FirebaseModule = typeof import('./lib/firebase');
 let firebasePromise: Promise<FirebaseModule> | null = null;
-const loadFirebase = () => (firebasePromise ??= import('./lib/firebase'));
+const loadFirebase = () =>
+  (firebasePromise ??= import('./lib/firebase').catch((err) => {
+    firebasePromise = null;
+    throw err;
+  }));
 
-/** Opens a link in a new tab without giving it access to this page. Returns false if blocked. */
-function openInNewTab(url: string): boolean {
-  const win = window.open('about:blank', '_blank');
-  if (!win) return false;
-  win.opener = null;
-  win.location.href = url;
-  return true;
+/** Removes what Google sign-in saved in this browser (before switching to "keep nothing"). */
+async function clearFirebaseTraces() {
+  try {
+    for (const k of Object.keys(localStorage)) if (k.startsWith('firebase:')) localStorage.removeItem(k);
+  } catch {
+    // storage blocked
+  }
+  // This page may still hold them open; the deletion then finishes when it reloads.
+  await deleteNamedDatabase('firebaseLocalStorageDb', { waitIfBlocked: false });
+  await deleteNamedDatabase('firebase-heartbeat-database', { waitIfBlocked: false });
 }
+
+const METHOD_NAME: Record<LinkMethod, string> = { paired: 'QR / PIN pairing', google: 'Google', wallet: 'the wallet' };
 
 export default function App() {
   return (
@@ -47,19 +67,36 @@ function useTheme() {
   return [theme, setTheme] as const;
 }
 
+/**
+ * Reads what the app was opened with, and removes it from the address bar:
+ *  - text shared into the app from another app (Android share menu; see shareTarget.ts)
+ *  - a pairing invitation after "#" (from a QR code)
+ */
+function takeLaunchParams(): { invite: string | null; shared: Promise<string> } {
+  const shared = takeSharedText(); // first: it reads (and cleans) the query part of the address
+  const invite = parseInviteLink(location.hash);
+  if (location.hash) history.replaceState(history.state, '', `${location.pathname}${location.search}`);
+  return { invite, shared };
+}
+
 function Shell() {
   const toast = useToast();
-  const me = useMemo(getDevice, []);
-  const isMobile = me.type !== 'desktop';
   const [theme, setTheme] = useTheme();
+  const [launch] = useState(takeLaunchParams);
+  const [sharedText, setSharedText] = useState('');
+  useEffect(() => {
+    void launch.shared.then((t) => t && setSharedText(t));
+  }, [launch]);
 
-  const [session, setSession] = useState<RoomSession | null>(null);
-  const [boot, setBoot] = useState<'loading' | 'ready' | 'unreachable'>('loading');
-  const [busy, setBusy] = useState(false);
+  const [joining, setJoining] = useState<JoinUi | null>(null);
+  const joinAbort = useRef<AbortController | null>(null);
+  const [knock, setKnock] = useState<Knock | null>(null);
+  /** "Allow this device?" questions, shown one at a time (several devices may ask at once). */
+  const knockQueue = useRef<Array<{ knock: Knock; resolve: (allow: boolean) => void }>>([]);
+  const showNextKnock = () => setKnock(knockQueue.current[0]?.knock ?? null);
   const [walletOpen, setWalletOpen] = useState(false);
   const [busyWallet, setBusyWallet] = useState<string | null>(null);
-  const [qrItem, setQrItem] = useState<SharedItem | null>(null);
-  const [pairSignal, setPairSignal] = useState(0);
+  const [qrItem, setQrItem] = useState<StoredItem | null>(null);
   const [freshIds, setFreshIds] = useState<Set<string>>(new Set());
   const [autoOpen, setAutoOpen] = useState(() => loadPref('autoOpen', false));
   const firebaseRef = useRef<FirebaseModule | null>(null);
@@ -67,135 +104,109 @@ function Shell() {
   autoOpenRef.current = autoOpen;
   const unread = useRef(0);
 
-  const adopt = useCallback((s: RoomSession) => {
-    saveSession(s);
-    setSession(s);
-    setBoot('ready');
-  }, []);
+  const problem = useCallback((message: string) => toast({ tone: 'error', title: 'Something went wrong', body: message }, 8000), [toast]);
 
-  const startFreshRoom = useCallback(async () => {
-    try {
-      adopt(await api.newRoom());
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 0) setBoot('unreachable');
-      else toast({ tone: 'error', title: 'Could not start a room', body: (err as Error).message });
-    }
-  }, [adopt, toast]);
-
-  /* ---------------------------------- boot ---------------------------------- */
-
-  const runBoot = useCallback(async () => {
-    setBoot('loading');
-    const params = new URLSearchParams(location.search);
-    const pairToken = params.get('pair');
-    if (pairToken) {
-      // Opened from a pairing QR code: remove the token from the address bar right away.
-      params.delete('pair');
-      history.replaceState(null, '', `${location.pathname}${params.size ? `?${params}` : ''}${location.hash}`);
-      try {
-        adopt(await api.claimPairToken(pairToken));
-        toast({ tone: 'success', title: 'Connected', body: 'This device is now paired. Anything you send appears on both screens.' });
-        return;
-      } catch (err) {
-        if (err instanceof ApiError && err.status === 0) return setBoot('unreachable');
-        toast({ tone: 'error', title: 'QR code did not work', body: (err as Error).message }, 8000);
-      }
-    }
-
-    const saved = loadSession();
-    if (saved) {
-      try {
-        await api.checkSession(saved.token);
-        adopt(saved);
-        return;
-      } catch (err) {
-        if (err instanceof ApiError && err.status === 0) return setBoot('unreachable');
-      }
-    }
-    await startFreshRoom();
-  }, [adopt, startFreshRoom, toast]);
-
-  useEffect(() => {
-    runBoot();
-  }, []);
-
-  // If another tab of this browser pairs or signs in, follow it into the new room.
-  useEffect(() => {
-    const onStorage = (e: StorageEvent) => {
-      if (e.key !== 'qrls.session' || !e.newValue) return;
-      try {
-        const next = JSON.parse(e.newValue) as RoomSession;
-        if (next?.token) setSession((cur) => (cur?.token === next.token ? cur : next));
-      } catch {
-        // ignore malformed values
-      }
-    };
-    window.addEventListener('storage', onStorage);
-    return () => window.removeEventListener('storage', onStorage);
-  }, []);
-
-  // Load Google sign-in ahead of time. Safari/iOS only allow the sign-in popup if it
-  // opens right after the tap, with no downloading in between.
-  useEffect(() => {
-    if (boot !== 'ready' || session?.method === 'google') return;
-    const start = () =>
-      loadFirebase()
-        .then(async (m) => {
-          await m.authReady();
-          firebaseRef.current = m;
-        })
-        .catch(() => {});
-    const idle = (window as unknown as { requestIdleCallback?: (cb: () => void) => void }).requestIdleCallback;
-    if (idle) idle(start);
-    else setTimeout(start, 1500);
-  }, [boot, session?.method]);
-
-  /* ------------------------------- real time -------------------------------- */
-
-  const onNewItem = useCallback(
-    (item: SharedItem) => {
+  const onIncoming = useCallback(
+    ({ item, from }: IncomingNotice) => {
       setFreshIds((s) => new Set(s).add(item.id));
-      setTimeout(() => setFreshIds((s) => {
-        const n = new Set(s);
-        n.delete(item.id);
-        return n;
-      }), 3000);
-      navigator.vibrate?.(30);
-
+      setTimeout(
+        () =>
+          setFreshIds((s) => {
+            const n = new Set(s);
+            n.delete(item.id);
+            return n;
+          }),
+        3000
+      );
+      // Browsers only allow vibration after the person has tapped the page once.
+      if ((navigator as Navigator & { userActivation?: { hasBeenActive: boolean } }).userActivation?.hasBeenActive) navigator.vibrate?.(30);
       if (document.visibilityState === 'hidden') {
         unread.current += 1;
         document.title = `(${unread.current}) qrLinkShare`;
       }
-
+      // A note that contains exactly one link (e.g. shared from a maps or shopping app) opens like a link.
+      const noteLinks = item.kind === 'text' ? extractLinks(item.text ?? '') : [];
+      const link = item.kind === 'link' ? item.url! : noteLinks.length === 1 ? noteLinks[0] : null;
+      if (link && autoOpenRef.current && openInNewTab(link)) return;
       const what = item.kind === 'link' ? 'link' : item.kind === 'file' ? 'file' : 'note';
-      if (item.kind === 'link' && autoOpenRef.current && openInNewTab(item.url!)) return;
       toast({
         tone: 'info',
-        title: `New ${what} from ${item.from.name}`,
+        title: `New ${item.retention === 'saved' ? 'saved ' : ''}${what} from ${from.name}`,
         body: item.kind === 'link' ? item.url : item.kind === 'file' ? item.file?.name : item.text?.slice(0, 120),
-        action: item.kind === 'link' ? { label: 'Open', onClick: () => openInNewTab(item.url!) } : undefined,
+        action: link ? { label: 'Open', onClick: () => openInNewTab(link) } : undefined,
       });
     },
     [toast]
   );
 
-  const onDeviceJoined = useCallback(
-    (d: DeviceInfo) => {
-      if (d.id === me.id) return;
-      setPairSignal((n) => n + 1);
-      toast({ tone: 'success', title: `${d.name} connected`, body: 'You can now send things between these devices.' });
-    },
-    [me.id, toast]
+  /** Shows the "Allow this device?" sheet; it closes by itself if that device gives up. */
+  const askKnock = useCallback(
+    (device: DeviceInfo, reason: Knock['reason'], code: string, signal: AbortSignal) =>
+      new Promise<boolean>((resolve) => {
+        if (signal.aborted) return resolve(false);
+        const entry = { knock: { device, reason, code }, resolve };
+        knockQueue.current.push(entry);
+        if (knockQueue.current.length === 1) showNextKnock();
+        signal.addEventListener(
+          'abort',
+          () => {
+            const i = knockQueue.current.indexOf(entry);
+            if (i === -1) return;
+            knockQueue.current.splice(i, 1);
+            resolve(false);
+            if (i === 0) showNextKnock();
+            if (reason === 'pin') toast({ tone: 'info', title: `${device.name} stopped waiting`, body: 'Nothing was connected.' }, 4000);
+          },
+          { once: true }
+        );
+      }),
+    [toast]
   );
 
-  const room = useRoom(session, {
-    onNewItem,
-    onDeviceJoined,
-    onUnauthorized: () => {
-      toast({ tone: 'error', title: 'Session expired', body: 'Starting a new room. Pair your devices again.' });
-      startFreshRoom();
+  const onDeviceGone = useCallback(
+    (name: string, method: LinkMethod, still: LinkMethod[]) => {
+      const title = method === 'paired' ? `${name} unpaired` : `${name} signed out of ${method === 'google' ? 'Google' : 'the wallet'}`;
+      const body = still.length
+        ? `It's still connected through ${still.map((m) => METHOD_NAME[m]).join(' and ')}.`
+        : 'It no longer connects to this device.';
+      toast({ tone: 'info', title, body }, 5000);
     },
+    [toast]
+  );
+
+  const p2p = useP2P({
+    onIncoming,
+    onProblem: problem,
+    onAccountKnock: (device, code, signal) => askKnock(device, 'account', code, signal),
+    onDeviceGone,
+    onGroupMove: (from) =>
+      toast({ tone: 'info', title: `${from.name} paired with another device`, body: 'This device now connects to it too.' }, 6000),
   });
+  const isMobile = p2p.self.type !== 'desktop';
+
+  // Google sign-in: load its code now, so a new version published while this tab stays open
+  // can't break it later.
+  useEffect(() => {
+    if (!p2p.ready || p2p.account?.kind !== 'google') return;
+    void loadFirebase().catch(() => {});
+    void import('./lib/verify').then((m) => m.preloadVerifier()).catch(() => {});
+  }, [p2p.ready, p2p.account?.kind]);
+
+  // A part of the app couldn't be downloaded (offline, or a newer version replaced it).
+  useEffect(() => {
+    const onPreloadError = () =>
+      toast(
+        {
+          tone: 'info',
+          title: 'Part of qrLinkShare couldn’t load',
+          body: 'You may be offline, or a new version is out. Reload to continue.',
+          action: { label: 'Reload', onClick: () => location.reload() },
+        },
+        10000
+      );
+    window.addEventListener('vite:preloadError', onPreloadError);
+    return () => window.removeEventListener('vite:preloadError', onPreloadError);
+  }, [toast]);
 
   useEffect(() => {
     const onVisible = () => {
@@ -208,53 +219,197 @@ function Shell() {
     return () => document.removeEventListener('visibilitychange', onVisible);
   }, []);
 
-  const peerCount = room.devices.filter((d) => d.id !== me.id).length;
+  /* ------------------------------- pairing ------------------------------- */
 
-  /* -------------------------------- actions --------------------------------- */
-
-  const claimPin = async (pin: string) => {
-    setBusy(true);
-    try {
-      adopt(await api.claimPin(pin));
-      toast({ tone: 'success', title: 'Connected', body: 'This device is now paired.' });
-    } catch (err) {
-      toast({ tone: 'error', title: 'Could not connect', body: (err as Error).message });
-    } finally {
-      setBusy(false);
-    }
+  const join = useCallback(
+    async (code: { invite?: string; pin?: string }) => {
+      const mesh = p2p.mesh.current;
+      if (!mesh) return;
+      joinAbort.current?.abort();
+      const abort = new AbortController();
+      joinAbort.current = abort;
+      const label: Record<JoinStatus, string> = {
+        looking: code.pin ? 'Looking for the device showing this PIN…' : 'Looking for the other device…',
+        found: 'Connecting to the other device…',
+        approval: code.pin ? 'Now tap Allow on the other device.' : 'Connecting to the other device…',
+      };
+      const live = () => !abort.signal.aborted && joinAbort.current === abort;
+      setJoining({ text: label.looking });
+      // This device's other paired devices, named in the questions below.
+      const others = [
+        ...p2p.devices.filter((d) => d.method === 'paired'),
+        ...p2p.knownDevices.filter((d) => d.methods.includes('paired')),
+      ].map((d) => d.name);
+      const othersText = others.length ? others.slice(0, 3).join(', ') + (others.length > 3 ? '…' : '') : 'your other paired devices';
+      // Own items still waiting to be sent: a newly paired device would get them.
+      const waiting = p2p.items.filter((i) => i.from.id === p2p.self.id && i.status === 'pending').length;
+      const waitingText = waiting ? ` It will also get the ${waiting === 1 ? 'item' : `${waiting} items`} waiting on this device.` : '';
+      try {
+        const res = await mesh.joinWith(code, {
+          mySecret: p2p.currentGroup,
+          paired: p2p.hasPaired(),
+          waiting,
+          signal: abort.signal,
+          onStatus: (st) => live() && setJoining((j) => ({ ...(j ?? {}), text: label[st] })),
+          confirm: ({ code: sas, host, merge }) =>
+            new Promise<boolean>((resolve) => {
+              if (!live()) return resolve(false);
+              const onAnswer = (yes: boolean) => {
+                if (live()) setJoining((j) => (j ? { ...j, ask: undefined, text: yes ? label.approval : j.text } : j));
+                resolve(yes);
+              };
+              abort.signal.addEventListener('abort', () => resolve(false), { once: true });
+              if (sas) {
+                setJoining({
+                  text: 'Found it. Compare this code with the other screen.',
+                  code: sas,
+                  ask: {
+                    question:
+                      (merge
+                        ? `Does the other device show this same code? Pairing also connects it to ${othersText}.`
+                        : 'Does the other device show this same code?') + waitingText,
+                    yes: 'It matches',
+                    onAnswer,
+                  },
+                });
+              } else {
+                setJoining({
+                  text: `Pair with ${host?.name ?? 'this device'}?`,
+                  ask: {
+                    question: (merge ? `${othersText} will connect to it too.` : 'It will get everything you send from now on.') + waitingText,
+                    yes: 'Pair',
+                    onAnswer,
+                  },
+                });
+              }
+            }),
+        });
+        if (!res.adopted) await p2p.joinGroup(res.secret);
+        toast({
+          tone: 'success',
+          title: res.host ? `Paired with ${res.host.name}` : 'Paired',
+          body: 'These devices now connect automatically whenever both have this page open.',
+        });
+      } catch (err) {
+        if ((err as Error).name !== 'AbortError') toast({ tone: 'error', title: 'Could not pair', body: (err as Error).message }, 9000);
+      } finally {
+        if (joinAbort.current === abort) {
+          joinAbort.current = null;
+          setJoining(null);
+        }
+      }
+    },
+    [p2p.mesh, p2p.currentGroup, p2p.hasPaired, p2p.joinGroup, p2p.devices, p2p.knownDevices, p2p.items, p2p.self.id, toast]
+  );
+  const joinRef = useRef(join);
+  joinRef.current = join;
+  const cancelJoin = () => {
+    joinAbort.current?.abort();
+    joinAbort.current = null;
+    setJoining(null);
   };
 
-  const onScanned = async (text: string) => {
-    let token: string | null = null;
-    try {
-      token = new URL(text).searchParams.get('pair');
-    } catch {
-      // not a URL
-    }
-    if (!token) {
+  // Opened from a pairing QR code (also when the link is opened in a tab that already has the app).
+  useEffect(() => {
+    if (!p2p.ready) return;
+    if (launch.invite) void joinRef.current({ invite: launch.invite });
+    const onHash = () => {
+      const invite = parseInviteLink(location.hash);
+      if (!invite) return;
+      history.replaceState(null, '', `${location.pathname}${location.search}`);
+      void joinRef.current({ invite });
+    };
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, [p2p.ready]);
+
+  const onKnock = useCallback(
+    (device: DeviceInfo, code: string, signal: AbortSignal) => askKnock(device, 'pin', code, signal),
+    [askKnock]
+  );
+
+  /** This device had no paired devices and the new one did: join the new one's group. */
+  const onAdopt = useCallback((secret: string) => p2p.adoptGroup(secret), [p2p.adoptGroup]);
+
+  /** A pairing attempt didn't pair and the code was replaced: say why (some of these can be someone else trying). */
+  const onSpent = useCallback(
+    (reason: SpentReason, paused: boolean) => {
+      const body: Partial<Record<SpentReason, string>> = {
+        collision: 'Two devices used this PIN at the same time. For safety a new code is shown; try again with it.',
+        unfinished: 'A device entered this PIN but didn’t finish. Nothing was connected, and a new PIN is shown.',
+        blocked: 'A device joined with this PIN but didn’t continue. For safety a new PIN is shown.',
+      };
+      const text = body[reason];
+      if (paused) {
+        toast({ tone: 'error', title: 'PIN pairing paused', body: 'A device kept entering this PIN without finishing. Use the QR code, or show a PIN again when ready.' }, 10000);
+      } else if (text) {
+        toast({ tone: 'info', title: reason === 'collision' ? 'Two devices used this PIN at once' : 'New PIN', body: text }, 8000);
+      }
+    },
+    [toast]
+  );
+
+  const answerKnock = (allow: boolean) => {
+    const head = knockQueue.current.shift();
+    head?.resolve(allow);
+    showNextKnock();
+  };
+
+  const onPaired = useCallback(
+    (device: DeviceInfo) => toast({ tone: 'success', title: `${device.name} paired`, body: 'You can now send things between these devices.' }),
+    [toast]
+  );
+
+  const onScanned = (text: string) => {
+    const invite = parseInviteLink(text);
+    if (!invite) {
       toast({ tone: 'error', title: 'Not a pairing code', body: 'Scan the QR code shown under "Show code" on the other device.' });
       return;
     }
-    setBusy(true);
-    try {
-      adopt(await api.claimPairToken(token));
-      toast({ tone: 'success', title: 'Connected', body: 'This device is now paired.' });
-    } catch (err) {
-      toast({ tone: 'error', title: 'Could not connect', body: (err as Error).message });
-    } finally {
-      setBusy(false);
-    }
+    void join({ invite });
   };
 
+  const onEnterPin = (raw: string) => {
+    const pin = cleanPin(raw);
+    if (pin) void join({ pin });
+  };
+
+  const unpair = async () => {
+    if (!confirm('Unpair this device? It stops connecting to the devices you paired with QR code or PIN. Your items stay on this device.')) return;
+    await p2p.unpair(randomSecret());
+    toast({ tone: 'info', title: 'Unpaired', body: 'Pair again any time with a QR code or PIN.' });
+  };
+
+  /* ------------------------------- accounts ------------------------------- */
+
+  /**
+   * Google sign-in is only loaded when someone taps the button, so people who never use
+   * it never load Google's sign-in code. The first time, Safari may block the popup
+   * because loading took a moment; the module is then ready and a second tap works.
+   */
   const signInGoogle = async () => {
-    setBusy(true);
+    let fb = firebaseRef.current;
+    if (!fb) {
+      try {
+        fb = await loadFirebase();
+        await fb.setRemember(!p2p.privateMode);
+        await fb.authReady();
+        firebaseRef.current = fb;
+      } catch {
+        toast({
+          tone: 'error',
+          title: 'Google sign-in couldn’t load',
+          body: 'You may be offline, or qrLinkShare was just updated. Reload the page to try again.',
+          action: { label: 'Reload', onClick: () => location.reload() },
+        });
+        return;
+      }
+    }
     try {
-      // Normally already loaded (see the preload above), so the popup opens straight from the tap.
-      const fb = firebaseRef.current ?? (await loadFirebase());
-      const idToken = await fb.getGoogleIdToken();
-      const s = await api.googleSignIn(idToken);
-      adopt(s);
-      toast({ tone: 'success', title: `Signed in as ${s.account}`, body: 'Sign in with the same Google account on your other device.' });
+      const user = await fb.signInWithGoogle();
+      const acc: Account = { kind: 'google', uid: user.uid, label: user.email };
+      p2p.setAccount(acc);
+      toast({ tone: 'success', title: `Signed in as ${user.email}`, body: 'Sign in with the same Google account on your other device.' });
     } catch (err) {
       const code = (err as { code?: string }).code || '';
       if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') return;
@@ -262,21 +417,19 @@ function Shell() {
         code === 'auth/unauthorized-domain'
           ? 'This website is not on the allowed list in Firebase. Add it under Firebase → Authentication → Settings → Authorized domains.'
           : code === 'auth/popup-blocked'
-            ? 'Your browser blocked the sign-in window. Allow pop-ups for this site and try again.'
+            ? 'Google sign-in is ready now. Tap “Continue with Google” again.'
             : (err as Error).message;
-      toast({ tone: 'error', title: 'Google sign-in failed', body }, 9000);
-    } finally {
-      setBusy(false);
+      toast({ tone: code === 'auth/popup-blocked' ? 'info' : 'error', title: code === 'auth/popup-blocked' ? 'One more tap' : 'Google sign-in failed', body }, 9000);
     }
   };
 
   const pickWallet = async (wallet: WalletOption) => {
     setBusyWallet(wallet.id);
     try {
-      const s = await signInWithWallet(wallet);
-      adopt(s);
+      const { address, roomKey } = await unlockWalletRoom(wallet);
+      p2p.setAccount({ kind: 'wallet', address, label: shortAddress(address), roomKey });
       setWalletOpen(false);
-      toast({ tone: 'success', title: `Wallet ${s.account} connected`, body: 'Connect the same wallet on your other device.' });
+      toast({ tone: 'success', title: `Wallet ${shortAddress(address)} linked`, body: 'Link the same wallet on your other device.' });
     } catch (err) {
       toast({ tone: 'error', title: 'Wallet sign-in failed', body: walletErrorMessage(err) });
     } finally {
@@ -284,93 +437,214 @@ function Shell() {
     }
   };
 
-  const leave = async () => {
-    if (session?.method === 'google') await (await loadFirebase()).signOutGoogle();
-    saveSession(null);
-    await startFreshRoom();
-    toast({ tone: 'info', title: session?.method === 'google' || session?.method === 'wallet' ? 'Signed out' : 'Left the room', body: 'This device is now in a new, empty room.' });
+  const signOut = async () => {
+    const wasGoogle = p2p.account?.kind === 'google';
+    await p2p.leaveAccount().catch(() => {});
+    if (wasGoogle) await loadFirebase().then((fb) => fb.signOutGoogle()).catch(() => {});
+    toast(
+      {
+        tone: 'info',
+        title: 'Signed out',
+        body: wasGoogle
+          ? 'Devices paired by QR code or PIN stay connected. This browser may still be signed in to Google itself: on a shared computer, also sign out at accounts.google.com.'
+          : 'Devices paired by QR code or PIN stay connected.',
+      },
+      wasGoogle ? 9000 : 5000
+    );
   };
 
-  const copy = (text: string, what: string) => {
-    copyText(text)
-      .then(() => toast({ tone: 'success', title: `${what} copied` }, 2000))
-      .catch(() => toast({ tone: 'error', title: 'Copy failed', body: 'Your browser blocked clipboard access.' }));
+  /* ------------------------------- this device ------------------------------- */
+
+  const togglePrivate = async () => {
+    if (!p2p.privateMode) {
+      const google = p2p.account?.kind === 'google' || !!firebasePromise;
+      if (
+        !confirm(
+          'Keep nothing on this computer?\n\nThis deletes everything qrLinkShare stored in this browser (items, pairing and this device’s identity) and reloads. From now on nothing is kept after the tab closes or reloads.' +
+            (google
+              ? '\n\nThis browser may still be signed in to Google itself (qrLinkShare can’t sign you out of Google). Before you leave this computer, sign out at accounts.google.com.'
+              : '')
+        )
+      )
+        return;
+      try {
+        // Tell the other devices to forget this one: it is about to become a different device.
+        await p2p.mesh.current?.sayBye('group').catch(() => {});
+        await p2p.mesh.current?.sayBye('account').catch(() => {});
+        // Switch first: other open tabs reload at once and let go of the database.
+        setPrivateMode(true);
+        forgetPairing();
+        await p2p.mesh.current?.destroy();
+        await clearUserIdentity(APP_ID).catch(() => {});
+        await deleteDatabase();
+        // Google last (it may need to download its code): sign out, briefly, then remove what it saved.
+        if (google) {
+          await Promise.race([loadFirebase().then((fb) => fb.signOutGoogle()), new Promise((r) => setTimeout(r, 1500))]).catch(() => {});
+          await clearFirebaseTraces();
+        }
+      } finally {
+        location.reload();
+      }
+      return;
+    } else {
+      if (!confirm('Start keeping items on this computer again?\n\nItems in this tab right now will be cleared, and the page reloads.')) return;
+      forgetPairing();
+      setPrivateMode(false);
+    }
+    location.reload();
   };
 
-  const deleteItem = async (item: SharedItem) => {
-    if (!session) return;
-    room.removeLocal(item.id);
-    api.deleteItem(session, item.id).catch((err) => toast({ tone: 'error', title: 'Delete failed', body: err.message }));
+  const backup = async () => {
+    const store = p2p.store.current;
+    if (!store) return;
+    try {
+      const blob = await createBackup(store);
+      downloadBlob(blob, `qrlinkshare-backup-${new Date().toISOString().slice(0, 10)}.tar`);
+    } catch (err) {
+      toast({ tone: 'error', title: 'Backup failed', body: (err as Error).message || 'Not enough memory or storage.' });
+    }
   };
 
-  const clearAll = async () => {
-    if (!session) return;
-    room.clearLocal();
-    api.clearRoom(session).catch((err) => toast({ tone: 'error', title: 'Clear failed', body: err.message }));
+  const restore = async (file: File) => {
+    const store = p2p.store.current;
+    if (!store) return;
+    try {
+      const added = await restoreBackup(store, file);
+      toast({ tone: 'success', title: added ? `Restored ${added} item${added > 1 ? 's' : ''}` : 'Nothing new to restore', body: added ? 'They are in Saved.' : undefined });
+    } catch (err) {
+      toast({ tone: 'error', title: 'Restore failed', body: (err as Error).message });
+    } finally {
+      await p2p.refresh(); // a restore that stopped part-way may still have added some items
+    }
   };
+
+  /* --------------------------------- items --------------------------------- */
+
+  const copy = useCallback(
+    (text: string, what: string) => {
+      copyText(text)
+        .then(() => toast({ tone: 'success', title: `${what} copied` }, 2000))
+        .catch(() => toast({ tone: 'error', title: 'Copy failed', body: 'Your browser blocked clipboard access.' }));
+    },
+    [toast]
+  );
+
+  const keepForeverRef = useRef(p2p.keepForever);
+  keepForeverRef.current = p2p.keepForever;
+  const keep = useCallback(async (item: StoredItem) => {
+    await keepForeverRef.current(item.id);
+    toast(
+      {
+        tone: 'success',
+        title: 'Moved to Saved',
+        body: safariMayDelete()
+          ? 'Kept until you delete it, but Safari deletes website data after 7 days without a visit. Back up now and then.'
+          : 'It stays on this device until you delete it.',
+      },
+      4000
+    );
+  }, [toast]);
+
+  const removeRef = useRef(p2p.remove);
+  removeRef.current = p2p.remove;
+  const retryRef = useRef(p2p.retry);
+  retryRef.current = p2p.retry;
+  const onDeleteItem = useCallback((item: StoredItem) => void removeRef.current(item.id), []);
+  const onRetryItem = useCallback(() => void retryRef.current(), []);
+
+  const clear = (retention: Retention) => void p2p.removeAll(retention);
 
   /* --------------------------------- render --------------------------------- */
 
-  if (boot === 'unreachable') return <Unreachable onRetry={runBoot} />;
-  if (boot === 'loading' || !session) return <BootScreen />;
+  if (!p2p.ready) {
+    return (
+      <div className="min-h-dvh flex flex-col items-center justify-center gap-4 px-4 text-center">
+        <Logo />
+        {p2p.startupError ? (
+          <div className="card p-5 max-w-sm" role="alert">
+            <p className="font-semibold flex items-center justify-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-danger" /> qrLinkShare couldn’t start
+            </p>
+            <p className="mt-2 text-sm text-muted">
+              {typeof window !== 'undefined' && !window.isSecureContext
+                ? 'qrLinkShare needs a secure address. Open it with https:// (or http://localhost on this computer).'
+                : 'This browser may be too old. Update it (on iPhone: Settings → General → Software Update) or try another browser.'}
+            </p>
+            <p className="mt-2 text-xs text-muted break-words">{p2p.startupError}</p>
+            <button type="button" className="btn btn-outline mt-4" onClick={() => location.reload()}>
+              Reload
+            </button>
+          </div>
+        ) : (
+          <Loader2 className="w-5 h-5 animate-spin text-muted" aria-label="Loading" />
+        )}
+      </div>
+    );
+  }
 
-  const isAccount = session.method === 'google' || session.method === 'wallet';
-  const deviceList = (
-    <DeviceList
-      devices={room.devices.length ? room.devices : [{ ...me, method: session.method, joinedAt: '' }]}
-      myDeviceId={me.id}
-      onLeave={leave}
-      leaveLabel={isAccount ? 'Sign out on this device' : 'Leave & start a new room'}
-    />
-  );
-
+  const deviceCount = p2p.devices.length;
+  /** Paired or signed-in devices exist (connected now or not). */
+  const paired = deviceCount > 0 || p2p.knownDevices.length > 0;
+  const savedCount = p2p.items.filter((i) => i.retention === 'saved').length;
   return (
     <div className="min-h-dvh flex flex-col">
       <Header
-        session={session}
-        status={room.status}
-        deviceCount={room.devices.length}
+        ready={p2p.ready}
+        relay={p2p.relay}
+        deviceCount={deviceCount}
+        account={p2p.account}
         theme={theme}
         onTheme={setTheme}
-        onSignOut={leave}
+        onSignOut={signOut}
       />
 
       <main className="flex-1 w-full max-w-6xl mx-auto px-4 sm:px-6 py-6 sm:py-8">
-        {peerCount === 0 && room.items.length === 0 && (
+        {!paired && p2p.items.length === 0 && (
           <div className="mb-6 sm:mb-8 max-w-2xl animate-rise">
             <h1 className="text-[28px] sm:text-4xl font-extrabold tracking-tight leading-[1.1]">
               Phone <span className="text-brand">⇄</span> computer.
-              <br className="hidden sm:block" /> Send anything, instantly.
+              <br className="hidden sm:block" /> Directly, privately.
             </h1>
             <p className="mt-3 text-muted text-[15px] sm:text-base">
-              Links, photos, PDFs, documents and notes, both ways, in real time. No app, no cable, no emailing yourself.
+              Links, photos, PDFs, documents and notes go straight from one device to the other. Nothing is stored on any server.
             </p>
           </div>
         )}
 
-        <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,380px)_minmax(0,1fr)] gap-5 lg:gap-8 items-start">
-          <aside className="space-y-5 lg:sticky lg:top-24">
+        {/* One copy of each panel; on computers the left column holds connect + devices + data. */}
+        <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,380px)_minmax(0,1fr)] lg:grid-rows-[auto_auto_auto_1fr] gap-5 lg:gap-x-8 items-start">
+          <div className="lg:col-start-1 lg:row-start-1">
             <ConnectPanel
-              session={session}
+              mesh={p2p.mesh.current}
+              groupSecret={p2p.groupSecret}
+              account={p2p.account}
               isMobile={isMobile}
-              compact={peerCount > 0}
-              busy={busy}
-              refreshSignal={pairSignal}
-              onClaimPin={claimPin}
+              compact={paired}
+              joining={joining}
+              onCancelJoin={cancelJoin}
+              privateMode={p2p.privateMode}
+              hasPaired={p2p.hasPaired}
+              onKnock={onKnock}
+              onAdopt={onAdopt}
+              onPaired={onPaired}
+              onSpent={onSpent}
+              onEnterPin={onEnterPin}
               onScanned={onScanned}
               onGoogle={signInGoogle}
               onWallet={() => setWalletOpen(true)}
             />
-            <div className="hidden lg:block">{deviceList}</div>
-          </aside>
+          </div>
 
-          <div className="space-y-6 min-w-0">
-            <Composer session={session} peerCount={peerCount} onSent={room.addLocal} />
+          <div className="space-y-6 min-w-0 lg:col-start-2 lg:row-start-1 lg:row-span-4">
+            <Composer deviceCount={deviceCount} initialText={sharedText} sendText={p2p.sendText} sendFile={p2p.sendFile} />
             <Feed
-              items={room.items}
-              loading={room.status === 'connecting' && room.items.length === 0}
-              myDeviceId={me.id}
+              items={p2p.items}
+              loading={false}
+              myDeviceId={p2p.self.id}
+              online={deviceCount > 0}
+              deviceNames={p2p.deviceNames}
               freshIds={freshIds}
+              progress={p2p.progress}
               autoOpen={autoOpen}
               onToggleAutoOpen={() => {
                 const v = !autoOpen;
@@ -378,74 +652,58 @@ function Shell() {
                 savePref('autoOpen', v);
                 if (v) toast({ tone: 'info', title: 'Auto-open is on', body: 'If links don’t open, allow pop-ups for this site in your browser.' }, 6000);
               }}
+              getBlob={p2p.getBlob}
               onCopy={copy}
               onShowQr={setQrItem}
-              onDelete={deleteItem}
-              onClearAll={clearAll}
+              onKeep={keep}
+              onDelete={onDeleteItem}
+              onRetry={onRetryItem}
+              onClear={clear}
+              onProblem={problem}
             />
-            <div className="lg:hidden">{deviceList}</div>
+          </div>
+
+          <div className="lg:col-start-1 lg:row-start-2">
+            <DeviceList
+              self={p2p.self}
+              devices={p2p.devices}
+              offline={p2p.knownDevices}
+              onUnpair={unpair}
+              onForget={(d) => {
+                if (
+                  confirm(
+                    `Forget ${d.name}? It's removed from this list. If it was reset, that's all you need.\n\nIf it still has qrLinkShare (a lost phone, say), it reconnects the next time it's opened there. To shut it out, tap “Unpair this device” on each of your other devices, then pair them with each other again (and sign out of Google or the wallet there if you linked one).`
+                  )
+                ) {
+                  p2p.forgetDevice(d.id);
+                }
+              }}
+            />
+          </div>
+          <div className="lg:col-start-1 lg:row-start-3">
+            <DevicePanel
+              privateMode={p2p.privateMode}
+              persistent={p2p.persistent}
+              persisted={p2p.persisted}
+              savedCount={savedCount}
+              onTogglePrivate={togglePrivate}
+              onBackup={backup}
+              onRestore={restore}
+            />
           </div>
         </div>
       </main>
 
       <footer className="border-t border-line">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 py-5 flex flex-col sm:flex-row gap-2 justify-between text-xs text-muted">
-          <span>qrLinkShare. Items are stored on the server for 24 hours, then deleted.</span>
+          <span>qrLinkShare: devices talk directly to each other. Nothing is stored on any server.</span>
           <span>Pair with QR · PIN · Google · Web3 wallet</span>
         </div>
       </footer>
 
       <ItemQrModal item={qrItem} onClose={() => setQrItem(null)} />
-      <WalletModal
-        open={walletOpen}
-        isMobile={isMobile}
-        busyWallet={busyWallet}
-        onClose={() => setWalletOpen(false)}
-        onPick={pickWallet}
-      />
-    </div>
-  );
-}
-
-/** Loading screen. Free hosting puts the server to sleep when idle, so explain a slow start. */
-function BootScreen() {
-  const [slow, setSlow] = useState(false);
-  useEffect(() => {
-    const t = setTimeout(() => setSlow(true), 4000);
-    return () => clearTimeout(t);
-  }, []);
-  return (
-    <div className="min-h-dvh flex flex-col items-center justify-center gap-4 p-6 text-center">
-      <Logo />
-      <Loader2 className="w-5 h-5 animate-spin text-muted" aria-label="Loading" />
-      {slow && (
-        <p className="animate-rise text-sm text-muted max-w-xs" aria-live="polite">
-          Waking up the server… This can take up to a minute after a quiet period. Thanks for waiting.
-        </p>
-      )}
-    </div>
-  );
-}
-
-function Unreachable({ onRetry }: { onRetry: () => void }) {
-  return (
-    <div className="min-h-dvh flex items-center justify-center p-4">
-      <div className="card max-w-md w-full p-6 sm:p-8 text-center">
-        <div className="mx-auto w-12 h-12 rounded-2xl bg-surface-2 flex items-center justify-center">
-          <ServerCrash className="w-6 h-6 text-danger" />
-        </div>
-        <h1 className="mt-4 text-xl font-bold">Can’t reach the server</h1>
-        <p className="mt-2 text-sm text-muted">
-          qrLinkShare needs its live server to pass files between devices. Check your internet connection and try again.
-        </p>
-        <p className="mt-3 text-xs text-muted">
-          Hosting this page on GitHub Pages? Deploy the server too (for example on Render) and build the page with{' '}
-          <code className="font-mono">VITE_SERVER_URL</code> pointing to it.
-        </p>
-        <button type="button" className="btn btn-primary mt-6" onClick={onRetry}>
-          <RefreshCw className="w-4 h-4" /> Try again
-        </button>
-      </div>
+      <KnockModal knock={knock} onAnswer={answerKnock} />
+      <WalletModal open={walletOpen} isMobile={isMobile} busyWallet={busyWallet} onClose={() => setWalletOpen(false)} onPick={pickWallet} />
     </div>
   );
 }

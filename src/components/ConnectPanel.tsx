@@ -1,49 +1,100 @@
 import { lazy, Suspense, useEffect, useState } from 'react';
-import { ChevronDown, Copy, KeyRound, QrCode as QrIcon, RefreshCw, ScanLine, Wallet } from 'lucide-react';
-import type { RoomSession } from '../types/share';
+import { CameraOff, ChevronDown, Copy, KeyRound, Loader2, QrCode as QrIcon, RefreshCw, ScanLine, Wallet } from 'lucide-react';
+import type { Account, DeviceInfo } from '../types/share';
+import type { Mesh, SpentReason } from '../lib/mesh';
 import { formatPin } from '../lib/shared';
-import { copyText, pairingLink } from '../lib/api';
+import { copyText } from '../lib/browser';
 import { usePairing } from '../hooks/usePairing';
+import { formatCode } from './KnockModal';
 import { QrCode } from './QrCode';
 import { PinInput } from './PinInput';
 import { useToast } from './Toasts';
 
-// The camera scanner (and its QR decoder) only loads when someone opens the Scan tab.
-const QrScanner = lazy(() => import('./QrScanner').then((m) => ({ default: m.QrScanner })));
+/** The camera scanner (and its QR decoder) is a separate download. */
+const loadScanner = () => import('./QrScanner');
+const QrScanner = lazy(() =>
+  loadScanner()
+    .then((m) => ({ default: m.QrScanner }))
+    // Offline, or a new version replaced the old files: show a message instead of a blank page.
+    .catch(() => ({ default: ScannerUnavailable }))
+);
+
+function ScannerUnavailable() {
+  return (
+    <div className="aspect-square rounded-2xl bg-surface-2 flex flex-col items-center justify-center gap-3 p-6 text-center">
+      <CameraOff className="w-8 h-8 text-muted" />
+      <p className="text-sm text-muted">Couldn’t load the camera scanner. You may be offline, or a new version of qrLinkShare is out.</p>
+      <button type="button" className="btn btn-outline text-sm" onClick={() => location.reload()}>
+        Reload
+      </button>
+    </div>
+  );
+}
 
 type Tab = 'show' | 'pin' | 'scan';
 
+/** What the joining area shows while this device pairs with another one. */
+export interface JoinUi {
+  text: string;
+  /** PIN pairing: the security code to compare with the other screen. */
+  code?: string;
+  /** A question for the person, answered with the buttons. */
+  ask?: { question: string; yes: string; onAnswer: (yes: boolean) => void };
+}
+
 interface Props {
-  session: RoomSession;
+  mesh: Mesh | null;
+  groupSecret: string;
+  account: Account | null;
   isMobile: boolean;
-  /** Other devices are already connected, so show a compact version. */
+  /** This device already has paired / signed-in devices, so show a compact version. */
   compact: boolean;
-  busy: boolean;
-  /** Bumped by the parent whenever a code was used, so we fetch a fresh one. */
-  refreshSignal: number;
-  onClaimPin: (pin: string) => Promise<void>;
+  /** Set while joining another device; shows what is happening. */
+  joining: JoinUi | null;
+  onCancelJoin: () => void;
+  /** "Keep nothing" mode: Google sign-in is hidden (it would leave this browser signed in to Google). */
+  privateMode: boolean;
+  hasPaired: () => boolean;
+  onKnock: (device: DeviceInfo, code: string, signal: AbortSignal) => Promise<boolean>;
+  onAdopt: (secret: string, device: DeviceInfo) => Promise<void>;
+  onPaired: (device: DeviceInfo, via: 'qr' | 'pin') => void;
+  /** A pairing attempt didn't pair and the code was replaced; `paused`: PIN pairing is now paused. */
+  onSpent: (reason: SpentReason, paused: boolean) => void;
+  onEnterPin: (pin: string) => void;
   onScanned: (text: string) => void;
   onGoogle: () => void;
   onWallet: () => void;
 }
 
 export function ConnectPanel(props: Props) {
-  const { session, isMobile, compact, busy, refreshSignal } = props;
+  const { mesh, isMobile, compact, joining } = props;
   const [tab, setTab] = useState<Tab>(isMobile ? 'pin' : 'show');
   const [expanded, setExpanded] = useState(!compact);
   const toast = useToast();
 
   useEffect(() => setExpanded(!compact), [compact]);
 
-  const showing = expanded && tab === 'show';
-  const pairing = usePairing(session, showing);
-
+  // Fetch the scanner in the background once the app has settled, so the Scan tab works
+  // offline and keeps working when a new version is published while this tab stays open.
   useEffect(() => {
-    if (refreshSignal > 0 && showing) pairing.refresh();
-  }, [refreshSignal]);
+    const prefetch = () => void loadScanner().catch(() => {});
+    const ric = (window as Partial<Pick<Window, 'requestIdleCallback'>>).requestIdleCallback;
+    if (ric) ric(prefetch, { timeout: 5000 });
+    else setTimeout(prefetch, 3000);
+  }, []);
 
-  const link = pairing.code ? pairingLink(pairing.code.pairToken) : '';
-  const isAccount = session.method === 'google' || session.method === 'wallet';
+  const open = expanded || !!joining;
+  const showing = open && tab === 'show' && !joining;
+  const pairing = usePairing({
+    mesh,
+    enabled: showing,
+    groupSecret: props.groupSecret,
+    hasPaired: props.hasPaired,
+    onKnock: props.onKnock,
+    onAdopt: props.onAdopt,
+    onPaired: props.onPaired,
+    onSpent: props.onSpent,
+  });
 
   const tabs: Array<{ id: Tab; label: string; icon: typeof QrIcon }> = [
     { id: 'show', label: 'Show code', icon: QrIcon },
@@ -56,7 +107,7 @@ export function ConnectPanel(props: Props) {
       <button
         type="button"
         className="w-full flex items-center justify-between gap-3 text-left"
-        aria-expanded={expanded}
+        aria-expanded={open}
         onClick={() => setExpanded((v) => !v)}
         disabled={!compact}
       >
@@ -73,13 +124,40 @@ export function ConnectPanel(props: Props) {
           </p>
         </div>
         {compact && (
-          <ChevronDown className={`w-5 h-5 text-muted shrink-0 transition-transform ${expanded ? 'rotate-180' : ''}`} />
+          <ChevronDown className={`w-5 h-5 text-muted shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} />
         )}
       </button>
 
-      {expanded && (
+      {joining && (
+        <div className="mt-5 rounded-2xl bg-surface-2 p-5" aria-live="polite">
+          <div className="flex items-center gap-3">
+            {!joining.ask && <Loader2 className="w-5 h-5 animate-spin text-brand shrink-0" />}
+            <p className="text-sm flex-1 min-w-0">{joining.text}</p>
+          </div>
+          {joining.code && (
+            <div className="mt-4 rounded-xl bg-surface p-4 text-center">
+              <p className="text-xs font-semibold uppercase tracking-wider text-muted">Security code</p>
+              <p className="mt-1 font-mono text-4xl font-semibold tracking-[0.15em] tabular-nums" aria-label={`Security code ${joining.code.split('').join(' ')}`}>
+                {formatCode(joining.code)}
+              </p>
+            </div>
+          )}
+          {joining.ask && <p className="mt-4 text-sm">{joining.ask.question}</p>}
+          <div className="mt-4 flex flex-wrap justify-end gap-2">
+            <button type="button" className="btn btn-ghost text-sm min-h-10 px-4" onClick={props.onCancelJoin}>
+              Cancel
+            </button>
+            {joining.ask && (
+              <button type="button" className="btn btn-primary text-sm min-h-10 px-4" onClick={() => joining.ask?.onAnswer(true)}>
+                {joining.ask.yes}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {open && !joining && (
         <div className="mt-5">
-          {/* Tabs */}
           <div role="tablist" aria-label="Pairing method" className="grid grid-cols-3 gap-1 p-1 rounded-xl bg-surface-2">
             {tabs.map((t) => (
               <button
@@ -101,59 +179,59 @@ export function ConnectPanel(props: Props) {
           <div className="mt-5" role="tabpanel">
             {tab === 'show' && (
               <div className="flex flex-col items-center text-center">
-                {pairing.error ? (
-                  <div className="w-full rounded-2xl bg-surface-2 p-6 text-sm text-muted">
-                    <p>{pairing.error}</p>
-                    <button type="button" className="btn btn-outline mt-4" onClick={pairing.refresh}>
-                      <RefreshCw className="w-4 h-4" /> Try again
+                <QrCode value={pairing.link} size={isMobile ? 200 : 232} label="QR code to pair another device" />
+                {pairing.pinPaused ? (
+                  <div className="mt-5 rounded-xl bg-surface-2 p-3 text-sm text-left" role="status">
+                    <p>
+                      <b>PIN pairing is paused.</b> A device kept entering this computer’s PIN without finishing. Use the QR code, or show
+                      a PIN again when you’re ready.
+                    </p>
+                    <button type="button" className="btn btn-outline text-sm mt-3" onClick={pairing.resumePin}>
+                      Show a PIN again
                     </button>
                   </div>
                 ) : (
                   <>
-                    <QrCode
-                      value={link || 'about:blank'}
-                      size={isMobile ? 200 : 232}
-                      label="QR code to pair another device"
-                      className={pairing.code ? '' : 'opacity-40'}
-                    />
                     <p className="mt-5 text-xs font-semibold uppercase tracking-wider text-muted">or enter this PIN</p>
                     <p className="mt-1 font-mono text-4xl font-semibold tracking-[0.12em] tabular-nums" aria-live="polite">
-                      {pairing.code ? formatPin(pairing.code.pin) : '··· ···'}
+                      {formatPin(pairing.pin)}
                     </p>
-                    <div className="mt-4 w-full max-w-60">
-                      <div className="h-1 rounded-full bg-surface-2 overflow-hidden">
-                        <div
-                          className="h-full bg-brand transition-[width] duration-1000 ease-linear"
-                          style={{ width: `${pairing.fractionLeft * 100}%` }}
-                        />
-                      </div>
-                      <div className="mt-2 flex items-center justify-between text-xs text-muted">
-                        <span className="tabular-nums">
-                          New code in {Math.floor(pairing.secondsLeft / 60)}:{String(pairing.secondsLeft % 60).padStart(2, '0')}
-                        </span>
-                        <span className="flex items-center gap-1">
-                          <button type="button" className="hover:text-ink cursor-pointer p-1" onClick={pairing.refresh} aria-label="New code">
-                            <RefreshCw className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            type="button"
-                            className="hover:text-ink cursor-pointer p-1"
-                            aria-label="Copy pairing link"
-                            disabled={!link}
-                            onClick={() =>
-                              copyText(link)
-                                .then(() => toast({ tone: 'success', title: 'Pairing link copied', body: 'Open it on the other device within 3 minutes.' }))
-                                .catch(() => {})
-                            }
-                          >
-                            <Copy className="w-3.5 h-3.5" />
-                          </button>
-                        </span>
-                      </div>
-                    </div>
-                    <p className="mt-4 text-xs text-muted">Each code works once and expires after 3 minutes.</p>
                   </>
                 )}
+                <div className="mt-4 w-full max-w-60">
+                  <div className="h-1 rounded-full bg-surface-2 overflow-hidden">
+                    <div
+                      className="h-full bg-brand transition-[width] duration-1000 ease-linear"
+                      style={{ width: `${pairing.fractionLeft * 100}%` }}
+                    />
+                  </div>
+                  <div className="mt-2 flex items-center justify-between text-xs text-muted">
+                    <span className="tabular-nums">
+                      New code in {Math.floor(pairing.secondsLeft / 60)}:{String(pairing.secondsLeft % 60).padStart(2, '0')}
+                    </span>
+                    <span className="flex items-center gap-1">
+                      <button type="button" className="hover:text-ink cursor-pointer p-1" onClick={pairing.refresh} aria-label="New code">
+                        <RefreshCw className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        className="hover:text-ink cursor-pointer p-1"
+                        aria-label="Copy pairing link"
+                        onClick={() =>
+                          // A fresh code, so the full 3 minutes are left.
+                          copyText(pairing.refresh())
+                            .then(() => toast({ tone: 'success', title: 'Pairing link copied', body: 'Open it on the other device within 3 minutes. It works once.' }))
+                            .catch(() => {})
+                        }
+                      >
+                        <Copy className="w-3.5 h-3.5" />
+                      </button>
+                    </span>
+                  </div>
+                </div>
+                <p className="mt-4 text-xs text-muted max-w-xs">
+                  Keep this screen open while the other device connects. Each code works once.
+                </p>
               </div>
             )}
 
@@ -162,8 +240,7 @@ export function ConnectPanel(props: Props) {
                 <p className="text-sm text-muted mb-4">
                   On the other device, open this website and choose <b className="text-ink">Show code</b>. Then type the 6 digits here.
                 </p>
-                <PinInput disabled={busy} onComplete={(pin) => props.onClaimPin(pin)} />
-                {busy && <p className="mt-3 text-sm text-muted">Connecting…</p>}
+                <PinInput disabled={!!joining} onComplete={props.onEnterPin} />
               </div>
             )}
 
@@ -179,21 +256,28 @@ export function ConnectPanel(props: Props) {
             )}
           </div>
 
-          {/* Account sign-in */}
-          {!isAccount && (
+          {!props.account && (
             <div className="mt-6 pt-5 border-t border-line">
               <p className="text-sm font-semibold">Or sign in on both devices</p>
               <p className="text-sm text-muted mt-0.5">
-                Every device signed in to the same account connects automatically. No codes needed.
+                Your devices signed in to the same {props.privateMode ? 'wallet' : 'Google account or wallet'} find each other. The first time,
+                {props.privateMode ? ' they connect right away.' : ' Google asks you to confirm a code on both.'}
               </p>
-              <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2 gap-2">
-                <button type="button" className="btn btn-outline" disabled={busy} onClick={props.onGoogle}>
-                  <GoogleMark /> Continue with Google
-                </button>
-                <button type="button" className="btn btn-outline" disabled={busy} onClick={props.onWallet}>
+              <div className={`mt-4 grid grid-cols-1 gap-2 ${props.privateMode ? '' : 'sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2'}`}>
+                {!props.privateMode && (
+                  <button type="button" className="btn btn-outline" onClick={props.onGoogle}>
+                    <GoogleMark /> Continue with Google
+                  </button>
+                )}
+                <button type="button" className="btn btn-outline" onClick={props.onWallet}>
                   <Wallet className="w-4 h-4" /> Connect wallet
                 </button>
               </div>
+              {props.privateMode && (
+                <p className="mt-3 text-xs text-muted">
+                  Google sign-in is off in “Keep nothing” mode: it would leave this browser signed in to Google for the next person.
+                </p>
+              )}
             </div>
           )}
         </div>

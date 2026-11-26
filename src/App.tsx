@@ -49,7 +49,10 @@ function useTheme() {
 function takeLaunchParams(): { invite: string | null; shared: string } {
   const invite = parseInviteLink(location.hash);
   const q = new URLSearchParams(location.search);
-  const shared = [q.get('share-title'), q.get('share-text'), q.get('share-url')].filter(Boolean).join('\n').trim();
+  // Shared from another app (Android): a link wins (so it's sent as a clickable link), then text, then the title.
+  const url = q.get('share-url')?.trim();
+  const text = q.get('share-text')?.trim();
+  const shared = (url || text || q.get('share-title') || '').trim();
   if (invite || shared || location.hash) {
     ['share-title', 'share-text', 'share-url'].forEach((k) => q.delete(k));
     history.replaceState(null, '', `${location.pathname}${q.size ? `?${q}` : ''}`);

@@ -156,8 +156,8 @@ export function Composer({ deviceCount, initialText, sendText, sendFile }: Props
   }, [text]);
 
   const options: Array<{ id: Retention; label: string; hint: string; icon: typeof Clock }> = [
-    { id: 'temp', label: 'Temporary', hint: 'Disappears after 24 hours', icon: Clock },
-    { id: 'saved', label: 'Save', hint: 'Kept until you delete it', icon: Bookmark },
+    { id: 'temp', label: 'Temporary', hint: 'Gone in 24 h', icon: Clock },
+    { id: 'saved', label: 'Save', hint: 'Until you delete it', icon: Bookmark },
   ];
 
   return (

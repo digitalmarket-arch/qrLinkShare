@@ -52,8 +52,8 @@ export function Feed(props: Props) {
   const visible = filter === 'all' ? list : list.filter((i) => i.kind === filter);
 
   const sections: Array<{ id: Retention; label: string; icon: typeof Clock; hint: string }> = [
-    { id: 'temp', label: 'Temporary', icon: Clock, hint: 'Gone after 24 hours' },
-    { id: 'saved', label: 'Saved', icon: Bookmark, hint: 'Kept until you delete them' },
+    { id: 'temp', label: 'Temporary', icon: Clock, hint: 'Gone after 24 h' },
+    { id: 'saved', label: 'Saved', icon: Bookmark, hint: 'Until you delete them' },
   ];
   const filters: Array<{ id: Filter; label: string }> = [
     { id: 'all', label: 'All' },
@@ -72,7 +72,7 @@ export function Feed(props: Props) {
             role="tab"
             aria-selected={section === s.id}
             onClick={() => setSection(s.id)}
-            className={`card px-4 py-3 text-left flex items-center gap-3 cursor-pointer transition-colors ${
+            className={`card px-3 sm:px-4 py-3 text-left flex items-center gap-2.5 sm:gap-3 cursor-pointer transition-colors ${
               section === s.id ? '!border-brand ring-2 ring-[var(--ring)]' : 'hover:bg-surface-2'
             }`}
           >
@@ -80,7 +80,7 @@ export function Feed(props: Props) {
               <s.icon className="w-4 h-4" />
             </span>
             <span className="min-w-0">
-              <span className="block font-bold leading-tight">
+              <span className="block font-bold leading-tight whitespace-nowrap">
                 {s.label} <span className="text-muted font-semibold tabular-nums">({bySection[s.id].length})</span>
               </span>
               <span className="block text-xs text-muted truncate">{s.hint}</span>

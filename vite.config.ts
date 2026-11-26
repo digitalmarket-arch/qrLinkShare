@@ -25,7 +25,8 @@ export default defineConfig({
  * Production builds only: once the bundle is on disk, writes <outDir>/sw.js from the template
  * sw/sw.js, filling in
  * - VERSION: a short hash of every file in outDir (public/ files such as the manifest and icons
- *   included) and of the template, so any change gives a new cache and the old one is deleted;
+ *   included) and of the template, so any change gives a new cache (older ones are deleted
+ *   once no window that was open at the switch still needs them);
  * - PRECACHE: what the app needs offline ('./', assets/* without source maps, the manifest and
  *   the icons), saved when the service worker installs.
  */
